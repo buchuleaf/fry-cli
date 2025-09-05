@@ -1,6 +1,6 @@
 # Fry-CLI
 
-`Fry` is a project to see how far [gpt-oss](https://huggingface.co/openai/gpt-oss-20b) can be pushed through prompt/tool definition formatting and other trickery related to what gets fed to the model. 
+`Fry` is a project to see how far [gpt-oss](https://huggingface.co/openai/gpt-oss-20b) can be pushed through prompt/tool definition formatting.
 
 ## Features
 
