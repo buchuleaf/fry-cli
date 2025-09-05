@@ -8,6 +8,7 @@
 - Web browsing
 - Python code execution
 - File system operations
+- File patching
 - Shell command execution
 
 ## Requirements
