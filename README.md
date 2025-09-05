@@ -60,4 +60,4 @@ I plan to continue developing the project. Premium is only for those who wish to
 
 ## Todo
 
-- Add MCP supportl
+- Add MCP support
