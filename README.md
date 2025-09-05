@@ -12,7 +12,7 @@
 
 ## Requirements
 
-You will be prompted to select/enter an OpenAI Chat Completions endpoint when running `fry` (e.g. `http://localhost:8080/v1/chat/completions`).
+You must provide an OpenAI Chat Completions endpoint for `fry` to connect to (e.g. `http://localhost:8080/v1/chat/completions`).
 
 ## Installation
 
