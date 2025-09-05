@@ -311,6 +311,7 @@ const ChatInterface: React.FC<{
     apiKey: 'dummy'
   }));
   const turnMessages = useRef<Message[]>([]);
+  const conversationHistory = useRef<Message[]>([]);
 
   const appendTranscript = (node: TranscriptItem) => {
     setStaticItems(prev => [...prev, node]);
@@ -463,9 +464,8 @@ const ChatInterface: React.FC<{
   const processChatTurn = async (userInput: string) => {
     setIsProcessing(true);
     isInterruptedRef.current = false;
+    conversationHistory.current.push({ role: 'user', content: userInput });
     turnMessages.current = [{ role: 'user', content: userInput }];
-    // Collect assistant/tool messages to persist in backend history at end of turn
-    const messagesToPersist: Message[] = [];
     // Accumulate reasoning across tool-call loops until a final message is produced
     let accumulatedReasoning = '';
     
@@ -474,8 +474,8 @@ const ChatInterface: React.FC<{
       const workspaceContents = await localExecutor.current.getWorkspaceContents();
       await client.sendWorkspaceContents(sessionData.session_id, workspaceContents);
 
-      // Prepare chat turn
-      const backendData = await client.prepareChatTurn(sessionData.session_id, turnMessages.current);
+      // Prepare chat turn with full local history (no server persistence)
+      const backendData = await client.prepareChatTurn(sessionData.session_id, conversationHistory.current);
       const messagesForLlm = backendData.messages || [];
       const toolsForLlm = backendData.tools || [];
 
@@ -636,8 +636,7 @@ const ChatInterface: React.FC<{
         setIsAssistantStreaming(false);
 
         turnMessages.current.push(assistantMessage);
-        // Persist assistant turn content/tool_calls later
-        messagesToPersist.push(assistantMessage);
+        conversationHistory.current.push(assistantMessage);
         // Send only supported fields to the LLM
         const assistantMessageForLlm: any = { role: 'assistant' };
         if (assistantMessage.content) assistantMessageForLlm.content = assistantMessage.content;
@@ -684,22 +683,12 @@ const ChatInterface: React.FC<{
 
           turnMessages.current.push(toolMessage);
           messagesForLlm.push(toolMessage);
-          // Persist tool outputs later
-          messagesToPersist.push(toolMessage);
+          conversationHistory.current.push(toolMessage);
         }
       }
     } catch (error) {
       appendTranscript(<Text color="red">Error: {String(error)}</Text>);
     } finally {
-      // Persist this turn's assistant + tool messages to backend history for next turn context
-      try {
-        if (!isInterruptedRef.current && messagesToPersist.length > 0) {
-          await client.prepareChatTurn(sessionData.session_id, messagesToPersist);
-        }
-      } catch (e) {
-        // Log persistence failure but do not crash UI
-        appendTranscript(<Text color="yellow">Warning: could not persist messages to history.</Text>);
-      }
       if (isInterruptedRef.current) {
         // Flush partial line on interrupt
         if (liveAssistantContentRef.current.length > 0) {
@@ -738,6 +727,7 @@ const ChatInterface: React.FC<{
         setIsAssistantStreaming(false);
         // No timers to clear
         turnMessages.current = [];
+        conversationHistory.current = [];
 
         const newSession = await client.startSession();
         if (newSession) {
