@@ -20,6 +20,32 @@ import { spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import { readFile } from 'fs/promises';
 
+// Helper: list the user's current working directory (root where 'fry' is run)
+async function getRootDirectoryListing(maxChars: number = 4000): Promise<string> {
+  try {
+    const dir = process.cwd();
+    const entries = await fs.readdir(dir, { withFileTypes: true });
+    const lines: string[] = [];
+    let totalChars = 0;
+
+    for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+      if (entry.name === '__pycache__' || entry.name === '.DS_Store') continue;
+      const isDir = entry.isDirectory();
+      const line = isDir ? `${entry.name}/` : `${entry.name}`;
+      if (totalChars + line.length > maxChars) {
+        lines.push('... (listing truncated)');
+        break;
+      }
+      lines.push(line);
+      totalChars += line.length;
+    }
+
+    return lines.length > 0 ? lines.join('\n') : 'Directory is empty.';
+  } catch (error: any) {
+    return `Error reading directory: ${error?.message || String(error)}`;
+  }
+}
+
 // Self-update on startup: check npm for newer version and attempt update
 async function getCurrentPkgVersion(): Promise<string | null> {
   try {
@@ -608,9 +634,9 @@ const ChatInterface: React.FC<{
     let accumulatedReasoning = '';
     
     try {
-      // Send workspace contents
-      const workspaceContents = await localExecutor.current.getWorkspaceContents();
-      await client.sendWorkspaceContents(sessionData.session_id, workspaceContents);
+      // Send the root directory listing (the directory where 'fry' was run)
+      const rootListing = await getRootDirectoryListing();
+      await client.sendWorkspaceContents(sessionData.session_id, rootListing);
 
       // Prepare chat turn with full local history (no server persistence)
       const backendData = await client.prepareChatTurn(sessionData.session_id, conversationHistory.current);
