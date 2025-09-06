@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // client.tsx
-import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { render, Text, Box, useInput, useApp, Newline, Spacer, useStdin, Static } from 'ink';
+import React, { useState, useEffect, useRef } from 'react';
+import { render, Text, Box, useInput, useApp, Static } from 'ink';
 // Removed animated spinner to avoid frequent re-renders that can disrupt scroll
 import TextInput from 'ink-text-input';
 import Gradient from 'ink-gradient';

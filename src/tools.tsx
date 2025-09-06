@@ -27,36 +27,7 @@ export class LocalToolExecutor {
   private workspaceDir: string = process.cwd();
   private toolChunks: Map<string, string[]> = new Map();
 
-  constructor() {
-    // No need to create the working directory; it already exists.
-  }
-
-  async getWorkspaceContents(maxChars: number = 4000): Promise<string> {
-    // Return ONLY the top-level listing of the working directory.
-    // One item per line; directories end with '/'. No recursion.
-    try {
-      const dir = this.workspaceDir;
-      const entries = await fs.readdir(dir, { withFileTypes: true });
-      const lines: string[] = [];
-      let totalChars = 0;
-
-      for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
-        if (entry.name === '__pycache__' || entry.name === '.DS_Store') continue;
-        const isDir = entry.isDirectory();
-        const line = isDir ? `${entry.name}/` : `${entry.name}`;
-        if (totalChars + line.length > maxChars) {
-          lines.push('... (listing truncated)');
-          break;
-        }
-        lines.push(line);
-        totalChars += line.length;
-      }
-
-      return lines.length > 0 ? lines.join('\n') : 'Directory is empty.';
-    } catch (error) {
-      return `Error reading directory: ${error}`;
-    }
-  }
+  constructor() {}
 
   private getSafePath(userPath: string): string | null {
     const workspaceRoot = path.resolve(this.workspaceDir);
@@ -490,6 +461,7 @@ export class LocalToolExecutor {
     const lines = patchText.split(/\r?\n/);
     let i = 0;
     const results: string[] = [];
+    const diffs: string[] = [];
 
     const safe = (rel: string): string | null => this.getSafePath(rel);
     const ensureParent = async (p: string) => {
@@ -532,6 +504,16 @@ export class LocalToolExecutor {
           await ensureParent(target);
           await fs.writeFile(target, contentLines.join('\n'), 'utf-8');
           results.push(`Added file: ${relPath}`);
+          // Diff-style display for added files
+          diffs.push(`File added: ${relPath}`);
+          if (contentLines.length === 0) {
+            diffs.push('(empty file)');
+          } else {
+            for (let ln = 0; ln < contentLines.length; ln++) {
+              const num = (ln + 1).toString().padStart(String(contentLines.length).length, ' ');
+              diffs.push(`+ [${num}] ${contentLines[ln]}`);
+            }
+          }
           continue;
         }
 
@@ -544,6 +526,20 @@ export class LocalToolExecutor {
             if (stat.isDirectory()) {
               return { status: 'error', data: `Delete File path is a directory (unsupported): ${relPath}` };
             }
+            // Prepare diff prior to deletion
+            try {
+              const oldContent = await fs.readFile(target, 'utf-8');
+              const oldLines = oldContent.split('\n');
+              diffs.push(`File deleted: ${relPath}`);
+              if (oldLines.length === 0) {
+                diffs.push('(empty file)');
+              } else {
+                for (let ln = 0; ln < oldLines.length; ln++) {
+                  const num = (ln + 1).toString().padStart(String(oldLines.length).length, ' ');
+                  diffs.push(`- [${num}] ${oldLines[ln]}`);
+                }
+              }
+            } catch {}
             await fs.unlink(target);
             results.push(`Deleted file: ${relPath}`);
           } catch {
@@ -576,6 +572,12 @@ export class LocalToolExecutor {
           }
 
           let content = await fs.readFile(originalTarget, 'utf-8');
+          const originalContentForDiff = content; // keep pristine for old-line numbering
+          const fileHunkDiffs: Array<{
+            oldStart: number;
+            newStart: number;
+            records: Array<{ type: ' ' | '-' | '+'; text: string }>;
+          }> = [];
 
           // Apply hunks (supports LF and CRLF files)
           while (i < lines.length && !lines[i].startsWith('*** ')) {
@@ -584,6 +586,7 @@ export class LocalToolExecutor {
             }
             const oldBlock: string[] = [];
             const newBlock: string[] = [];
+            const records: Array<{ type: ' ' | '-' | '+'; text: string }> = [];
             while (
               i < lines.length &&
               !lines[i].startsWith('@@') &&
@@ -593,6 +596,7 @@ export class LocalToolExecutor {
               if (hl === '') {
                 oldBlock.push('');
                 newBlock.push('');
+                records.push({ type: ' ', text: '' });
                 i += 1;
                 continue;
               }
@@ -601,10 +605,13 @@ export class LocalToolExecutor {
               if (prefix === ' ') {
                 oldBlock.push(body);
                 newBlock.push(body);
+                records.push({ type: ' ', text: body });
               } else if (prefix === '-') {
                 oldBlock.push(body);
+                records.push({ type: '-', text: body });
               } else if (prefix === '+') {
                 newBlock.push(body);
+                records.push({ type: '+', text: body });
               } else {
                 return { status: 'error', data: `Invalid hunk line: ${hl}` };
               }
@@ -617,12 +624,27 @@ export class LocalToolExecutor {
             if (!oldTextLF && !newTextLF) {
               continue;
             }
-            if (content.includes(oldTextLF)) {
-              content = content.replace(oldTextLF, newTextLF);
-            } else if (content.includes(oldTextCRLF)) {
+            // Determine starting line numbers for diff output
+            const idxInCurrentLF = content.indexOf(oldTextLF);
+            const idxInCurrentCRLF = content.indexOf(oldTextCRLF);
+            const useCRLF = idxInCurrentLF === -1 && idxInCurrentCRLF !== -1;
+            const idxInCurrent = useCRLF ? idxInCurrentCRLF : idxInCurrentLF;
+            const idxInOriginalLF = originalContentForDiff.indexOf(oldTextLF);
+            const idxInOriginalCRLF = originalContentForDiff.indexOf(oldTextCRLF);
+            const idxInOriginal = idxInOriginalLF !== -1 ? idxInOriginalLF : idxInOriginalCRLF;
+            if (idxInCurrent === -1) {
+              return { status: 'error', data: `Hunk context not found while updating ${originalRel}.` };
+            }
+            const countLines = (s: string) => (s.match(/\n/g) || []).length + 1;
+            const oldStart = idxInOriginal !== -1 ? countLines(originalContentForDiff.slice(0, idxInOriginal)) : countLines(content.slice(0, idxInCurrent));
+            const newStart = countLines(content.slice(0, idxInCurrent));
+            fileHunkDiffs.push({ oldStart, newStart, records });
+
+            // Apply the actual replacement in content
+            if (useCRLF) {
               content = content.replace(oldTextCRLF, newTextCRLF);
             } else {
-              return { status: 'error', data: `Hunk context not found while updating ${originalRel}.` };
+              content = content.replace(oldTextLF, newTextLF);
             }
 
             if (i < lines.length && lines[i].trim() === '*** End of File') {
@@ -643,6 +665,30 @@ export class LocalToolExecutor {
           } else {
             results.push(`Updated file: ${relPath}`);
           }
+          // Emit diff for updated file
+          diffs.push(`File edited: ${relPath}`);
+          if (fileHunkDiffs.length === 0) {
+            diffs.push('(no line changes)');
+          } else {
+            for (const h of fileHunkDiffs) {
+              let oldLine = h.oldStart;
+              let newLine = h.newStart;
+              for (const rec of h.records) {
+                if (rec.type === ' ') {
+                  oldLine += 1;
+                  newLine += 1;
+                } else if (rec.type === '-') {
+                  const num = oldLine.toString();
+                  diffs.push(`- [${num}] ${rec.text}`);
+                  oldLine += 1;
+                } else if (rec.type === '+') {
+                  const num = newLine.toString();
+                  diffs.push(`+ [${num}] ${rec.text}`);
+                  newLine += 1;
+                }
+              }
+            }
+          }
           continue;
         }
 
@@ -659,7 +705,10 @@ export class LocalToolExecutor {
         return { status: 'error', data: "Patch missing required '*** End Patch' terminator." };
       }
 
-      return { status: 'success', data: results.length ? results.join('\n') : 'Patch applied with no changes.' };
+      // Combine summary and diffs for user display
+      const summary = results.length ? results.join('\n') : 'Patch applied with no changes.';
+      const diffDisplay = diffs.length ? `\n\nChanges:\n${diffs.join('\n')}` : '';
+      return { status: 'success', data: summary + diffDisplay };
     } catch (e: any) {
       return { status: 'error', data: `An error occurred applying patch: ${e?.message || String(e)}` };
     }
