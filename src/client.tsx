@@ -632,32 +632,44 @@ const ChatInterface: React.FC<{
       const lines = resultText.split('\n');
       let startLine = 1;
       if (isReadChunk) {
-        // Parse call args to find tool_call_id and chunk index
+        // Parse call args to find tool_call_id and either chunk index or start_line range
         try {
           const argsObj = JSON.parse(toolCall.function.arguments || '{}');
           const callId: string | undefined = argsObj.tool_call_id;
-          const chunkIdx: number = typeof argsObj.chunk === 'number' ? argsObj.chunk : 0;
-          if (callId) {
-            const countsMap = readChunkLineCountsRef.current.get(callId);
-            if (countsMap && chunkIdx > 0) {
-              // Sum known counts of prior chunks; only adjust if all are known
-              let sum = 0;
-              let allKnown = true;
-              for (let i = 0; i < chunkIdx; i++) {
-                const c = countsMap.get(i);
-                if (typeof c === 'number') sum += c; else { allKnown = false; break; }
+          const haveStart = Number.isFinite(Number(argsObj.start_line ?? argsObj.line_start)) || typeof argsObj.lines === 'string';
+          if (haveStart) {
+            // Line-range mode: begin numbering at the requested start_line
+            let s: number | undefined = Number(argsObj.start_line ?? argsObj.line_start);
+            if ((!s || !Number.isFinite(s)) && typeof argsObj.lines === 'string') {
+              const m = String(argsObj.lines).trim().match(/^(\d+)\s*(?:\.{2}|-|:)\s*(\d+)$/);
+              if (m) s = Number(m[1]);
+            }
+            if (s && Number.isFinite(s) && s > 0) startLine = Math.floor(s);
+          } else {
+            // Chunk-index mode
+            const chunkIdx: number = typeof argsObj.chunk === 'number' ? argsObj.chunk : 0;
+            if (callId) {
+              const countsMap = readChunkLineCountsRef.current.get(callId);
+              if (countsMap && chunkIdx > 0) {
+                // Sum known counts of prior chunks; only adjust if all are known
+                let sum = 0;
+                let allKnown = true;
+                for (let i = 0; i < chunkIdx; i++) {
+                  const c = countsMap.get(i);
+                  if (typeof c === 'number') sum += c; else { allKnown = false; break; }
+                }
+                if (allKnown) startLine = 1 + sum;
               }
-              if (allKnown) startLine = 1 + sum;
+              // Record current chunk's line count
+              let mapForCall = countsMap;
+              if (!mapForCall) {
+                mapForCall = new Map();
+                readChunkLineCountsRef.current.set(callId, mapForCall);
+              }
+              mapForCall.set(chunkIdx, lines.length);
+              // Track last served index to keep in sync with auto-inferred chunks
+              readChunkLastIdxRef.current.set(callId, chunkIdx);
             }
-            // Record current chunk's line count
-            let mapForCall = countsMap;
-            if (!mapForCall) {
-              mapForCall = new Map();
-              readChunkLineCountsRef.current.set(callId, mapForCall);
-            }
-            mapForCall.set(chunkIdx, lines.length);
-            // Track last served index to keep in sync with auto-inferred chunks
-            readChunkLastIdxRef.current.set(callId, chunkIdx);
           }
         } catch {}
       }

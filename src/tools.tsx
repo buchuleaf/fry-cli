@@ -76,7 +76,9 @@ export class LocalToolExecutor {
     // Return the standard notice plus the first chunk inline so the model
     // does not need to call read_chunk for an initial preview.
     const preview = chunks[0] ?? '';
-    const header = `Output is too large and has been split into ${chunks.length} chunks. Use workspace(action='read_chunk', tool_call_id='${toolCallId}', chunk=<0..${chunks.length - 1}>) to view more.`;
+    const header = `Output is too large and has been split into ${chunks.length} chunks. Use one of:\n` +
+      `  - workspace(action='read_chunk', tool_call_id='${toolCallId}', chunk=<0..${chunks.length - 1}>)\n` +
+      `  - workspace(action='read_chunk', tool_call_id='${toolCallId}', start_line=<start>, end_line=<end>)`;
     const decoratedPreview = `\n\nFirst chunk (0/${chunks.length - 1}):\n${preview}`;
     return {
       status: 'success',
@@ -474,16 +476,6 @@ export class LocalToolExecutor {
 
   private async handleReadChunk(args: any): Promise<ToolResult> {
     const toolCallId = args.tool_call_id;
-    // Infer next chunk if not provided, using the last-served index
-    let chunkNum: number;
-    if (args.chunk === undefined || args.chunk === null || args.chunk === '') {
-      const last = this.lastServedChunk.get(toolCallId) ?? 0;
-      chunkNum = last + 1;
-    } else {
-      const n = Number(args.chunk);
-      chunkNum = Number.isNaN(n) ? 0 : n;
-    }
-
     if (!toolCallId) {
       return { status: 'error', data: 'Missing tool_call_id.' };
     }
@@ -493,11 +485,62 @@ export class LocalToolExecutor {
       return { status: 'error', data: 'Invalid tool_call_id.' };
     }
 
+    // Optional line-range mode
+    const parseNum = (v: any): number | undefined => {
+      const n = Number(v);
+      return Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
+    };
+    const parseLinesSpec = (s: string): { start?: number, end?: number } => {
+      const m = String(s).trim().match(/^(\d+)\s*(?:\.{2}|-|:)\s*(\d+)$/);
+      if (m) {
+        const a = parseNum(m[1]);
+        const b = parseNum(m[2]);
+        return { start: a, end: b };
+      }
+      return {};
+    };
+
+    // Collect possible line-range fields
+    let startLine = parseNum(args.start_line ?? args.line_start);
+    let endLine = parseNum(args.end_line ?? args.line_end);
+    if (!startLine && typeof args.lines === 'string') {
+      const got = parseLinesSpec(args.lines);
+      startLine = got.start ?? startLine;
+      endLine = got.end ?? endLine;
+    }
+
+    if (startLine) {
+      // Line-range mode
+      // Reconstruct full text to slice by lines regardless of chunk boundaries
+      const fullText = chunks.join('');
+      const allLines = fullText.split('\n');
+      const totalLines = allLines.length;
+      if (!endLine) {
+        return { status: 'error', data: "Missing 'end_line'. Provide both start_line and end_line." };
+      }
+      if (startLine < 1 || startLine > totalLines) {
+        return { status: 'error', data: `start_line out of range. Valid: 1..${totalLines}` };
+      }
+      if (endLine < startLine) {
+        return { status: 'error', data: 'end_line must be >= start_line.' };
+      }
+      if (endLine > totalLines) endLine = totalLines;
+      const slice = allLines.slice(startLine - 1, endLine).join('\n');
+      return { status: 'success', data: slice };
+    }
+
+    // Chunk-index mode (backward compatible)
+    let chunkNum: number;
+    if (args.chunk === undefined || args.chunk === null || args.chunk === '') {
+      const last = this.lastServedChunk.get(toolCallId) ?? 0;
+      chunkNum = last + 1;
+    } else {
+      const n = Number(args.chunk);
+      chunkNum = Number.isNaN(n) ? 0 : n;
+    }
     if (chunkNum < 0 || chunkNum >= chunks.length) {
       return { status: 'error', data: 'Invalid chunk number.' };
     }
-
-    // Update last-served index for this tool_call_id
     this.lastServedChunk.set(toolCallId, chunkNum);
     return { status: 'success', data: chunks[chunkNum] };
   }
