@@ -15,6 +15,97 @@ import meow from 'meow';
 import dotenv from 'dotenv';
 import open from 'open';
 import { LocalToolExecutor, ToolCall, ToolResult } from './tools.js';
+import * as https from 'https';
+import { spawnSync } from 'child_process';
+import { fileURLToPath } from 'url';
+import { readFile } from 'fs/promises';
+
+// Self-update on startup: check npm for newer version and attempt update
+async function getCurrentPkgVersion(): Promise<string | null> {
+  try {
+    const pkgUrl = new URL('../package.json', import.meta.url);
+    const data = await readFile(fileURLToPath(pkgUrl), 'utf-8');
+    const json = JSON.parse(data);
+    return typeof json.version === 'string' ? json.version : null;
+  } catch {
+    return null;
+  }
+}
+
+function compareSemver(a: string, b: string): number {
+  const pa = a.split('.').map(n => parseInt(n, 10) || 0);
+  const pb = b.split('.').map(n => parseInt(n, 10) || 0);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const da = pa[i] ?? 0; const db = pb[i] ?? 0;
+    if (da > db) return 1;
+    if (da < db) return -1;
+  }
+  return 0;
+}
+
+async function fetchLatestVersion(pkgName: string, timeoutMs = 3000): Promise<string | null> {
+  return await new Promise((resolve) => {
+    const req = https.get(`https://registry.npmjs.org/${encodeURIComponent(pkgName)}`, { timeout: timeoutMs }, (res) => {
+      if (res.statusCode && res.statusCode >= 300) {
+        res.resume();
+        resolve(null);
+        return;
+      }
+      let body = '';
+      res.setEncoding('utf8');
+      res.on('data', (c) => { body += c; });
+      res.on('end', () => {
+        try {
+          const json = JSON.parse(body);
+          const latest = json?.['dist-tags']?.latest;
+          resolve(typeof latest === 'string' ? latest : null);
+        } catch {
+          resolve(null);
+        }
+      });
+    });
+    req.on('error', () => resolve(null));
+    req.on('timeout', () => { try { req.destroy(); } catch {} resolve(null); });
+  });
+}
+
+async function maybeSelfUpdate(opts?: { skip?: boolean, timeoutMs?: number }) {
+  try {
+    const envSkip = String(process.env.FRYCLI_NO_UPDATE || process.env.NO_UPDATE || '').toLowerCase();
+    if (opts?.skip || envSkip === '1' || envSkip === 'true') return;
+    const primary = '@buchuleaf/fry-cli';
+    const fallback = '@buchuleaf/frycli';
+    const current = await getCurrentPkgVersion();
+    if (!current) return;
+    let latest = await fetchLatestVersion(primary, opts?.timeoutMs ?? 3000);
+    let pkgName = primary;
+    if (!latest) { // try fallback name
+      latest = await fetchLatestVersion(fallback, opts?.timeoutMs ?? 3000);
+      if (latest) pkgName = fallback;
+    }
+    if (!latest) return;
+    if (compareSemver(latest, current) <= 0) return; // up-to-date or newer local
+
+    // Attempt global update; do not block for long and ignore errors
+    const npmCmd = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+    const args = ['i', '-g', `${pkgName}@latest`];
+    // Print a brief notice before Ink renders
+    console.log(`A new version of Fry CLI is available (${current} → ${latest}). Updating...`);
+    const result = spawnSync(npmCmd, args, {
+      stdio: 'ignore',
+      timeout: opts?.timeoutMs ?? 15000
+    });
+    if (result.error) {
+      console.log('Auto-update skipped (npm not available or permission denied).');
+    } else if (result.status !== 0) {
+      console.log('Auto-update failed (non-zero exit). Continuing with current version.');
+    } else {
+      console.log('Fry CLI updated successfully. You may need to re-run to use the new version.');
+    }
+  } catch {
+    // Swallow any unexpected errors to avoid impacting CLI usage
+  }
+}
 
 // Lightweight Markdown renderer for single lines, streaming-friendly (no external deps)
 const MarkdownLine: React.FC<{ content: string; inCodeBlock?: boolean }> = React.memo(({ content, inCodeBlock }) => {
@@ -1088,6 +1179,7 @@ const cli = meow(`
     --backend, -b  Backend URL (default: https://frycli.share.zrok.io)
     --model, -m    Model name (default: gpt-4)
     --show-analysis, -a  Show chain-of-thought (default: true)
+    --no-update     Skip automatic update check
 
   Examples
     $ frycli --backend http://localhost:8000 --model llama2
@@ -1108,12 +1200,19 @@ const cli = meow(`
       type: 'boolean',
       shortFlag: 'a',
       default: true
+    },
+    noUpdate: {
+      type: 'boolean',
+      default: false
     }
   }
 });
 
 // Load environment variables from project .env (if it exists)
 dotenv.config();
+
+// Attempt a quick self-update (non-blocking beyond a short timeout)
+await maybeSelfUpdate({ skip: Boolean(cli.flags.noUpdate), timeoutMs: 15000 });
 
 // Render the app
 render(
