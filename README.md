@@ -28,7 +28,7 @@ You must provide an OpenAI Chat Completions endpoint for `fry` to connect to (e.
 
 Install Fry CLI:
 ```bash
-npm install -g @buchuleaf/frycli
+npm install -g @buchuleaf/fry-cli
 ```
 
 ## Getting started

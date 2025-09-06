@@ -1,6 +1,6 @@
 {
   "name": "@buchuleaf/fry-cli",
-  "version": "1.2.8",
+  "version": "1.2.9",
   "description": "A command-line interface for the Fry AI assistant.",
   "main": "dist/client.js",
   "type": "module",
@@ -16,7 +16,6 @@
     "start": "node dist/client.js"
   },
   "dependencies": {
-    "@buchuleaf/fry-cli": "^1.1.0",
     "axios": "^1.7.2",
     "dotenv": "^16.4.5",
     "glob": "^10.4.1",

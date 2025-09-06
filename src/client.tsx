@@ -17,6 +17,7 @@ import open from 'open';
 import { LocalToolExecutor, ToolCall, ToolResult } from './tools.js';
 import * as https from 'https';
 import { spawnSync } from 'child_process';
+import * as fsSync from 'fs';
 import { fileURLToPath } from 'url';
 import { readFile } from 'fs/promises';
 
@@ -112,19 +113,47 @@ async function maybeSelfUpdate(opts?: { skip?: boolean, timeoutMs?: number }) {
     if (!latest) return;
     if (compareSemver(latest, current) <= 0) return; // up-to-date or newer local
 
-    // Attempt global update; do not block for long and ignore errors
+    // Attempt global update; only try if global directory looks writable
     const npmCmd = process.platform === 'win32' ? 'npm.cmd' : 'npm';
-    const args = ['i', '-g', `${pkgName}@latest`];
+
+    // Ask npm where the global node_modules is and check writability
+    const rootProbe = spawnSync(npmCmd, ['root', '-g'], { encoding: 'utf8', timeout: 3000 });
+    let canWriteGlobal = false;
+    let globalRoot = '';
+    if (!rootProbe.error && rootProbe.status === 0 && typeof rootProbe.stdout === 'string') {
+      globalRoot = rootProbe.stdout.trim();
+      try {
+        fsSync.accessSync(globalRoot, fsSync.constants.W_OK);
+        canWriteGlobal = true;
+      } catch {
+        canWriteGlobal = false;
+      }
+    }
+
+    if (!canWriteGlobal) {
+      const hintCmd = process.platform === 'win32'
+        ? `npm i -g ${pkgName}@latest`
+        : `sudo npm i -g ${pkgName}@latest`;
+      console.log(`A new version of Fry CLI is available (${current} → ${latest}).`);
+      console.log('Auto-update skipped: no write access to global npm directory.');
+      console.log(`To update manually, run: ${hintCmd}`);
+      return;
+    }
+
     // Print a brief notice before Ink renders
     console.log(`A new version of Fry CLI is available (${current} → ${latest}). Updating...`);
+    const args = ['i', '-g', `${pkgName}@latest`];
     const result = spawnSync(npmCmd, args, {
-      stdio: 'ignore',
+      stdio: 'pipe',
+      encoding: 'utf8',
       timeout: opts?.timeoutMs ?? 15000
     });
     if (result.error) {
-      console.log('Auto-update skipped (npm not available or permission denied).');
+      console.log('Auto-update skipped (npm not available).');
     } else if (result.status !== 0) {
-      console.log('Auto-update failed (non-zero exit). Continuing with current version.');
+      const stderr = (result.stderr || '').toString().trim();
+      const tail = stderr.split('\n').slice(-1)[0] || 'unknown error';
+      console.log(`Auto-update failed: ${tail}. Continuing with current version.`);
     } else {
       console.log('Fry CLI updated successfully. You may need to re-run to use the new version.');
     }
