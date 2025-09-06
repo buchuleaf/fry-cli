@@ -6,10 +6,8 @@
 
 ### Tools:
 - Web browsing
-- Python code execution
-- File system operations
-- File patching
-- Shell command execution
+- Exec (shell or Python)
+- Workspace (file system ops + patching)
 
 ## Example test
 

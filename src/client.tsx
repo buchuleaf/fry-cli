@@ -490,7 +490,7 @@ const ChatInterface: React.FC<{
 
     let result: ToolResult;
 
-    if (toolName.startsWith('fs.') || toolName === 'python' || toolName === 'shell' || toolName === 'apply_patch') {
+    if (toolName === 'workspace' || toolName === 'exec' || toolName.startsWith('fs.') || toolName === 'python' || toolName === 'shell' || toolName === 'apply_patch') {
       try {
         // First, track the local tool call with the backend to enforce rate limits
         const trackResponse = await client.trackToolCall(sessionData.session_id, toolCall);
@@ -535,14 +535,26 @@ const ChatInterface: React.FC<{
     let resultText = typeof result.data === 'string' ? result.data : JSON.stringify(result.data, null, 2);
 
     // Add line numbers when reading file content
-    const isReadTool = toolName === 'fs.read' || toolName === 'fs.read_chunk';
+    let isReadTool = false;
+    let isReadChunk = false;
+    try {
+      const argsObj = JSON.parse(toolCall.function.arguments || '{}');
+      const action = (argsObj.action || '').toLowerCase();
+      if (toolName === 'workspace') {
+        isReadTool = action === 'read' || action === 'read_chunk';
+        isReadChunk = action === 'read_chunk';
+      } else if (toolName === 'fs.read' || toolName === 'fs.read_chunk') {
+        isReadTool = true;
+        isReadChunk = toolName === 'fs.read_chunk';
+      }
+    } catch {}
     const isLargeOutputNotice = typeof result.data === 'string' && resultText.startsWith('Output is too large');
     if (isReadTool && !isLargeOutputNotice) {
       // fs.read (small files) or fs.read_chunk (single chunk). For fs.read_chunk,
       // keep numbering continuous by using stored counts for earlier chunks.
       const lines = resultText.split('\n');
       let startLine = 1;
-      if (toolName === 'fs.read_chunk') {
+      if (isReadChunk) {
         // Parse call args to find tool_call_id and chunk index
         try {
           const argsObj = JSON.parse(toolCall.function.arguments || '{}');
@@ -586,10 +598,10 @@ const ChatInterface: React.FC<{
           const preview = resultText.slice(afterLabelNl + 1);
           const lines = preview.split('\n');
           // Store count for chunk 0 under this tool_call_id so that subsequent
-          // fs.read_chunk calls can continue line numbering.
+          // read_chunk calls can continue line numbering.
           try {
             const argsObj = JSON.parse(toolCall.function.arguments || '{}');
-            const callId: string | undefined = toolCall.id; // initial fs.read's own id
+            const callId: string | undefined = toolCall.id; // initial read's own id
             if (callId) {
               let mapForCall = readChunkLineCountsRef.current.get(callId);
               if (!mapForCall) {

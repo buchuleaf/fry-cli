@@ -101,7 +101,7 @@ export class LocalToolExecutor {
     // Return the standard notice plus the first chunk inline so the model
     // does not need to call read_chunk for an initial preview.
     const preview = chunks[0] ?? '';
-    const header = `Output is too large and has been split into ${chunks.length} chunks. Use fs.read_chunk(tool_call_id='${toolCallId}', chunk=<0..${chunks.length - 1}>) to view more.`;
+    const header = `Output is too large and has been split into ${chunks.length} chunks. Use workspace(action='read_chunk', tool_call_id='${toolCallId}', chunk=<0..${chunks.length - 1}>) to view more.`;
     const decoratedPreview = `\n\nFirst chunk (0/${chunks.length - 1}):\n${preview}`;
     return {
       status: 'success',
@@ -120,8 +120,12 @@ export class LocalToolExecutor {
     }
 
     try {
-      if (functionName.startsWith('fs.')) {
+      if (functionName === 'workspace') {
+        return await this.handleWorkspaceTool(args, toolCall.id);
+      } else if (functionName.startsWith('fs.')) {
         return await this.handleFsTool(functionName, args, toolCall.id);
+      } else if (functionName === 'exec') {
+        return await this.handleExecTool(args, toolCall.id);
       } else if (functionName === 'python') {
         return await this.handlePythonTool(args, toolCall.id);
       } else if (functionName === 'shell') {
@@ -133,6 +137,42 @@ export class LocalToolExecutor {
       }
     } catch (error) {
       return { status: 'error', data: `Error during tool execution: ${error}` };
+    }
+  }
+
+  private async handleExecTool(args: any, toolCallId: string): Promise<ToolResult> {
+    const runtime = (args.runtime || '').toLowerCase();
+    if (!runtime) return { status: 'error', data: "Missing 'runtime' ('shell' | 'python')." };
+    if (runtime === 'shell') {
+      const command = args.command || '';
+      return this.handleShellTool({ command }, toolCallId);
+    }
+    if (runtime === 'python') {
+      const code = args.code || '';
+      return this.handlePythonTool({ code }, toolCallId);
+    }
+    return { status: 'error', data: "Unsupported runtime. Use 'shell' or 'python'." };
+  }
+
+  private async handleWorkspaceTool(args: any, toolCallId: string): Promise<ToolResult> {
+    const action = (args.action || '').toLowerCase();
+    switch (action) {
+      case 'ls':
+        return this.handleLs({ path: args.path || '.' }, toolCallId);
+      case 'read':
+        return this.handleRead({ path: args.path }, toolCallId);
+      case 'write':
+        return this.handleWrite({ path: args.path, content: args.content });
+      case 'mkdir':
+        return this.handleMkdir({ path: args.path });
+      case 'search_files':
+        return this.handleSearchFiles({ pattern: args.pattern, file_pattern: args.file_pattern }, toolCallId);
+      case 'apply_patch':
+        return this.handleApplyPatch({ patch: args.patch });
+      case 'read_chunk':
+        return this.handleReadChunk({ tool_call_id: args.tool_call_id, chunk: args.chunk });
+      default:
+        return { status: 'error', data: "Unknown or missing 'action'. Use one of: ls, read, write, mkdir, search_files, apply_patch, read_chunk." };
     }
   }
 
@@ -300,7 +340,7 @@ export class LocalToolExecutor {
 
   private async handleRead(args: any, toolCallId: string): Promise<ToolResult> {
     const pathArg = args.path;
-    if (!pathArg) return { status: 'error', data: 'fs.read requires a path.' };
+    if (!pathArg) return { status: 'error', data: 'read requires a path.' };
 
     const safePath = this.getSafePath(pathArg);
     if (!safePath) return { status: 'error', data: 'Access denied.' };
