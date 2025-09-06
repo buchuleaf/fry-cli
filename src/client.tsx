@@ -532,7 +532,17 @@ const ChatInterface: React.FC<{
     }
 
     // Render tool result with content shown on the next line under the header
-    let resultText = typeof result.data === 'string' ? result.data : JSON.stringify(result.data, null, 2);
+    // Be defensive: JSON.stringify(undefined) returns undefined, which would break .split below.
+    let resultRaw: any = result?.data;
+    let resultText = typeof resultRaw === 'string' ? resultRaw : JSON.stringify(resultRaw, null, 2);
+    if (resultText === undefined || resultText === null) {
+      // Fall back to a safe string representation
+      try {
+        resultText = String(resultRaw ?? '');
+      } catch {
+        resultText = '';
+      }
+    }
 
     // Add line numbers when reading file content
     let isReadTool = false;
