@@ -26,6 +26,8 @@ export class LocalToolExecutor {
   // Root directory for all tool operations. Use the directory where fry-cli was launched.
   private workspaceDir: string = process.cwd();
   private toolChunks: Map<string, string[]> = new Map();
+  // Track the last-served chunk index per tool_call_id for read_chunk defaults
+  private lastServedChunk: Map<string, number> = new Map();
 
   constructor() {}
 
@@ -68,6 +70,8 @@ export class LocalToolExecutor {
     }
     
     this.toolChunks.set(toolCallId, chunks);
+    // Since we include the first chunk inline in the preview, initialize last-served to 0
+    this.lastServedChunk.set(toolCallId, 0);
 
     // Return the standard notice plus the first chunk inline so the model
     // does not need to call read_chunk for an initial preview.
@@ -470,7 +474,15 @@ export class LocalToolExecutor {
 
   private async handleReadChunk(args: any): Promise<ToolResult> {
     const toolCallId = args.tool_call_id;
-    const chunkNum = args.chunk || 0;
+    // Infer next chunk if not provided, using the last-served index
+    let chunkNum: number;
+    if (args.chunk === undefined || args.chunk === null || args.chunk === '') {
+      const last = this.lastServedChunk.get(toolCallId) ?? 0;
+      chunkNum = last + 1;
+    } else {
+      const n = Number(args.chunk);
+      chunkNum = Number.isNaN(n) ? 0 : n;
+    }
 
     if (!toolCallId) {
       return { status: 'error', data: 'Missing tool_call_id.' };
@@ -485,6 +497,8 @@ export class LocalToolExecutor {
       return { status: 'error', data: 'Invalid chunk number.' };
     }
 
+    // Update last-served index for this tool_call_id
+    this.lastServedChunk.set(toolCallId, chunkNum);
     return { status: 'success', data: chunks[chunkNum] };
   }
 

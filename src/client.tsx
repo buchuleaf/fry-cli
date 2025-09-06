@@ -454,6 +454,8 @@ const ChatInterface: React.FC<{
   const localExecutor = useRef(new LocalToolExecutor());
   // Track line counts of chunks per tool_call_id for fs.read/fs.read_chunk
   const readChunkLineCountsRef = useRef<Map<string, Map<number, number>>>(new Map());
+  // Track last chunk index served per tool_call_id so we can infer the next chunk
+  const readChunkLastIdxRef = useRef<Map<string, number>>(new Map());
   const openaiClient = useRef(new OpenAI({
     baseURL: modelEndpoint,
     apiKey: 'dummy'
@@ -493,6 +495,42 @@ const ChatInterface: React.FC<{
   const executeToolCall = async (toolCall: ToolCall): Promise<ToolResult> => {
     const toolName = toolCall.function.name;
     
+    // Parse arguments once and optionally augment them (e.g., infer missing chunk index)
+    let parsedArgs: any = null;
+    try {
+      parsedArgs = JSON.parse(toolCall.function.arguments || '{}');
+    } catch {
+      parsedArgs = null;
+    }
+    // If the model called workspace.read_chunk without specifying a chunk, default to the next chunk
+    try {
+      if (toolName === 'workspace' && parsedArgs && typeof parsedArgs === 'object') {
+        const action = String(parsedArgs.action || '').toLowerCase();
+        if (action === 'read_chunk') {
+          const callId: string | undefined = parsedArgs.tool_call_id;
+          if (callId) {
+            if (parsedArgs.chunk === undefined || parsedArgs.chunk === null || parsedArgs.chunk === '') {
+              const last = readChunkLastIdxRef.current.get(callId);
+              // Default to 1 since chunk 0 preview is shown inline with the original tool output
+              const nextIdx = typeof last === 'number' ? last + 1 : 1;
+              parsedArgs.chunk = nextIdx;
+            } else {
+              // Normalize to number when possible
+              const asNum = Number(parsedArgs.chunk);
+              if (!Number.isNaN(asNum)) parsedArgs.chunk = asNum;
+            }
+            // Update last-served index for this callId
+            const asNum = Number(parsedArgs.chunk);
+            if (!Number.isNaN(asNum)) {
+              readChunkLastIdxRef.current.set(callId, asNum);
+            }
+            // Write back augmented args for execution and logging
+            try { toolCall.function.arguments = JSON.stringify(parsedArgs); } catch {}
+          }
+        }
+      }
+    } catch {}
+
     try {
       const args = JSON.parse(toolCall.function.arguments);
       const argsStr = Object.entries(args)
@@ -618,6 +656,8 @@ const ChatInterface: React.FC<{
               readChunkLineCountsRef.current.set(callId, mapForCall);
             }
             mapForCall.set(chunkIdx, lines.length);
+            // Track last served index to keep in sync with auto-inferred chunks
+            readChunkLastIdxRef.current.set(callId, chunkIdx);
           }
         } catch {}
       }
@@ -648,6 +688,8 @@ const ChatInterface: React.FC<{
                 readChunkLineCountsRef.current.set(callId, mapForCall);
               }
               mapForCall.set(0, lines.length);
+              // Initialize last-served chunk to 0, since preview includes chunk 0
+              readChunkLastIdxRef.current.set(callId, 0);
             }
           } catch {}
           const width = String(lines.length).length;
