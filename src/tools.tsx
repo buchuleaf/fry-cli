@@ -137,7 +137,7 @@ export class LocalToolExecutor {
       case 'mkdir':
         return this.handleMkdir({ path: args.path });
       case 'search_files':
-        return this.handleSearchFiles({ pattern: args.pattern, file_pattern: args.file_pattern }, toolCallId);
+        return this.handleSearchFiles({ pattern: args.pattern, file_pattern: args.file_pattern, path: args.path }, toolCallId);
       case 'apply_patch':
         return this.handleApplyPatch({ patch: args.patch });
       case 'read_chunk':
@@ -367,19 +367,55 @@ export class LocalToolExecutor {
   private async handleSearchFiles(args: any, toolCallId: string): Promise<ToolResult> {
     const pattern = args.pattern;
     if (!pattern) return { status: 'error', data: 'Missing pattern argument.' };
-    
+
+    // Optional base path to scope the search. Defaults to workspace root.
+    const pathArg = args.path;
     const filePattern = args.file_pattern || '**/*';
-    
+
     try {
-      // Layer 1: Efficiently ignore common binary extensions and unwanted directories at the glob level.
-      const files = await glob.glob(path.join(this.workspaceDir, filePattern), {
-        ignore: [
-          '**/node_modules/**',
-          '**/.git/**',
-          '**/*.{jpg,jpeg,png,gif,bmp,ico,pdf,zip,gz,tar,rar,7z,exe,dll,so,o,a,class,pyc,mp3,mp4,mov,avi,wav,db,sqlite,sqlite3,dat,bin}',
-        ],
-        nodir: true, // We only want to search files, not directories.
-      });
+      let files: string[] = [];
+
+      // Resolve and validate the base path if provided.
+      if (pathArg) {
+        const safeBase = this.getSafePath(pathArg);
+        if (!safeBase) return { status: 'error', data: 'Access denied.' };
+        try {
+          const st = await fs.stat(safeBase);
+          if (st.isFile()) {
+            // If a single file is provided, search only that file.
+            files = [safeBase];
+          } else if (st.isDirectory()) {
+            // Search within the specified directory using the provided file pattern.
+            files = await glob.glob(filePattern, {
+              cwd: safeBase,
+              absolute: true,
+              ignore: [
+                '**/node_modules/**',
+                '**/.git/**',
+                '**/*.{jpg,jpeg,png,gif,bmp,ico,pdf,zip,gz,tar,rar,7z,exe,dll,so,o,a,class,pyc,mp3,mp4,mov,avi,wav,db,sqlite,sqlite3,dat,bin}',
+              ],
+              nodir: true,
+            });
+          } else {
+            return { status: 'error', data: 'Path is neither file nor directory.' };
+          }
+        } catch {
+          return { status: 'error', data: 'Path not found.' };
+        }
+      } else {
+        // No base path provided: search from the workspace root.
+        files = await glob.glob(filePattern, {
+          cwd: this.workspaceDir,
+          absolute: true,
+          ignore: [
+            '**/node_modules/**',
+            '**/.git/**',
+            '**/*.{jpg,jpeg,png,gif,bmp,ico,pdf,zip,gz,tar,rar,7z,exe,dll,so,o,a,class,pyc,mp3,mp4,mov,avi,wav,db,sqlite,sqlite3,dat,bin}',
+          ],
+          nodir: true,
+        });
+      }
+
       const matches: string[] = [];
 
       // Layer 2: For remaining files, perform a content-based check for binary data.
