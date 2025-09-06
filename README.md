@@ -1,5 +1,7 @@
 # Fry-CLI
 
+![test_prompt](assets/test_prompt.gif)
+
 `Fry` is a project to see how far [gpt-oss](https://huggingface.co/openai/gpt-oss-20b) can be pushed through prompt/tool definition formatting.
 
 ## Features

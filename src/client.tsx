@@ -306,6 +306,8 @@ const ChatInterface: React.FC<{
   // Removed thinking timer to reduce re-renders during streaming
   
   const localExecutor = useRef(new LocalToolExecutor());
+  // Track line counts of chunks per tool_call_id for fs.read/fs.read_chunk
+  const readChunkLineCountsRef = useRef<Map<string, Map<number, number>>>(new Map());
   const openaiClient = useRef(new OpenAI({
     baseURL: modelEndpoint,
     apiKey: 'dummy'
@@ -419,10 +421,41 @@ const ChatInterface: React.FC<{
     const isReadTool = toolName === 'fs.read' || toolName === 'fs.read_chunk';
     const isLargeOutputNotice = typeof result.data === 'string' && resultText.startsWith('Output is too large');
     if (isReadTool && !isLargeOutputNotice) {
+      // fs.read (small files) or fs.read_chunk (single chunk). For fs.read_chunk,
+      // keep numbering continuous by using stored counts for earlier chunks.
       const lines = resultText.split('\n');
-      const width = String(lines.length).length;
+      let startLine = 1;
+      if (toolName === 'fs.read_chunk') {
+        // Parse call args to find tool_call_id and chunk index
+        try {
+          const argsObj = JSON.parse(toolCall.function.arguments || '{}');
+          const callId: string | undefined = argsObj.tool_call_id;
+          const chunkIdx: number = typeof argsObj.chunk === 'number' ? argsObj.chunk : 0;
+          if (callId) {
+            const countsMap = readChunkLineCountsRef.current.get(callId);
+            if (countsMap && chunkIdx > 0) {
+              // Sum known counts of prior chunks; only adjust if all are known
+              let sum = 0;
+              let allKnown = true;
+              for (let i = 0; i < chunkIdx; i++) {
+                const c = countsMap.get(i);
+                if (typeof c === 'number') sum += c; else { allKnown = false; break; }
+              }
+              if (allKnown) startLine = 1 + sum;
+            }
+            // Record current chunk's line count
+            let mapForCall = countsMap;
+            if (!mapForCall) {
+              mapForCall = new Map();
+              readChunkLineCountsRef.current.set(callId, mapForCall);
+            }
+            mapForCall.set(chunkIdx, lines.length);
+          }
+        } catch {}
+      }
+      const width = String(startLine + lines.length - 1).length;
       resultText = lines
-        .map((line, idx) => `${String(idx + 1).padStart(width, ' ')} | ${line}`)
+        .map((line, idx) => `${String(startLine + idx).padStart(width, ' ')} | ${line}`)
         .join('\n');
     } else if (isReadTool && isLargeOutputNotice) {
       // For large outputs, we include the first chunk inline after a label.
@@ -435,6 +468,20 @@ const ChatInterface: React.FC<{
           const labelLine = resultText.slice(firstChunkLabelIdx, afterLabelNl); // without trailing \n
           const preview = resultText.slice(afterLabelNl + 1);
           const lines = preview.split('\n');
+          // Store count for chunk 0 under this tool_call_id so that subsequent
+          // fs.read_chunk calls can continue line numbering.
+          try {
+            const argsObj = JSON.parse(toolCall.function.arguments || '{}');
+            const callId: string | undefined = toolCall.id; // initial fs.read's own id
+            if (callId) {
+              let mapForCall = readChunkLineCountsRef.current.get(callId);
+              if (!mapForCall) {
+                mapForCall = new Map();
+                readChunkLineCountsRef.current.set(callId, mapForCall);
+              }
+              mapForCall.set(0, lines.length);
+            }
+          } catch {}
           const width = String(lines.length).length;
           const numbered = lines
             .map((line, idx) => `${String(idx + 1).padStart(width, ' ')} | ${line}`)
