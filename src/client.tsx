@@ -20,6 +20,8 @@ import { spawnSync } from 'child_process';
 import * as fsSync from 'fs';
 import { fileURLToPath } from 'url';
 import { readFile } from 'fs/promises';
+import { marked } from 'marked';
+import { markedTerminal } from 'marked-terminal';
 
 // Helper: list the user's current working directory (root where 'fry' is run)
 async function getRootDirectoryListing(maxChars: number = 4000): Promise<string> {
@@ -162,123 +164,30 @@ async function maybeSelfUpdate(opts?: { skip?: boolean, timeoutMs?: number }) {
   }
 }
 
-// Lightweight Markdown renderer for single lines, streaming-friendly (no external deps)
-const MarkdownLine: React.FC<{ content: string; inCodeBlock?: boolean }> = React.memo(({ content, inCodeBlock }) => {
-  const line = content ?? '';
+// Full Markdown renderer using marked + marked-terminal (ANSI output)
+// Configure once at module load
+try {
+  const width = Math.max(40, Math.min(process.stdout?.columns || 80, 120));
+  marked.use((markedTerminal as any)({
+    reflowText: true,
+    width,
+    tab: 2,
+    unescape: true
+  }));
+} catch {
+  // Fallback silently if configuration fails
+}
 
-  // Code block fence (```)
-  const isFence = /^\s*```/.test(line);
-  if (isFence) {
-    return <Text dimColor>{line}</Text>;
+const MarkdownBlock: React.FC<{ content: string }> = React.memo(({ content }) => {
+  const md = content ?? '';
+  let out = md;
+  try {
+    // marked.parse returns a string when using the terminal renderer
+    out = String(marked.parse(md));
+  } catch {
+    out = md;
   }
-
-  // Inside fenced code block: render as code without parsing inline
-  if (inCodeBlock) {
-    return <Text color="cyan">{line}</Text>;
-  }
-
-  // Headings: style entire line
-  if (/^\s*#{1,6}\s+/.test(line)) {
-    return <Text color="cyan" bold>{line}</Text>;
-  }
-
-  // Simple inline markdown tokenizer: `code`, **bold**, _italic_, [text](url)
-  type Seg = { type: 'text'|'code'|'bold'|'italic'|'link'; text: string; url?: string };
-  const segs: Seg[] = [];
-  let i = 0;
-  const s = line;
-  const len = s.length;
-
-  const pushText = (t: string) => { if (t) segs.push({ type: 'text', text: t }); };
-
-  while (i < len) {
-    const nextBacktick = s.indexOf('`', i);
-    const nextBold = s.indexOf('**', i);
-    const nextItal = s.indexOf('_', i);
-    const nextLink = s.indexOf('[', i);
-
-    // Choose the earliest token start
-    let next = Number.POSITIVE_INFINITY;
-    let kind: 'code'|'bold'|'italic'|'link'|null = null;
-    if (nextBacktick !== -1 && nextBacktick < next) { next = nextBacktick; kind = 'code'; }
-    if (nextBold !== -1 && nextBold < next) { next = nextBold; kind = 'bold'; }
-    if (nextItal !== -1 && nextItal < next) { next = nextItal; kind = 'italic'; }
-    if (nextLink !== -1 && nextLink < next) { next = nextLink; kind = 'link'; }
-
-    if (kind === null) {
-      pushText(s.slice(i));
-      break;
-    }
-
-    // Emit preceding text
-    if (next > i) pushText(s.slice(i, next));
-
-    if (kind === 'code') {
-      const end = s.indexOf('`', next + 1);
-      if (end !== -1) {
-        segs.push({ type: 'code', text: s.slice(next + 1, end) });
-        i = end + 1;
-      } else {
-        // No closing; treat as literal
-        pushText(s.slice(next));
-        break;
-      }
-      continue;
-    }
-
-    if (kind === 'bold') {
-      const end = s.indexOf('**', next + 2);
-      if (end !== -1) {
-        segs.push({ type: 'bold', text: s.slice(next + 2, end) });
-        i = end + 2;
-      } else {
-        pushText(s.slice(next));
-        break;
-      }
-      continue;
-    }
-
-    if (kind === 'italic') {
-      const end = s.indexOf('_', next + 1);
-      if (end !== -1) {
-        segs.push({ type: 'italic', text: s.slice(next + 1, end) });
-        i = end + 1;
-      } else {
-        pushText(s.slice(next));
-        break;
-      }
-      continue;
-    }
-
-    if (kind === 'link') {
-      const rb = s.indexOf(']', next + 1);
-      const lp = rb !== -1 ? s.indexOf('(', rb + 1) : -1;
-      const rp = lp !== -1 ? s.indexOf(')', lp + 1) : -1;
-      if (rb !== -1 && lp === rb + 1 && rp !== -1) {
-        const label = s.slice(next + 1, rb);
-        const url = s.slice(lp + 1, rp);
-        segs.push({ type: 'link', text: label, url });
-        i = rp + 1;
-      } else {
-        pushText(s.slice(next));
-        break;
-      }
-      continue;
-    }
-  }
-
-  return (
-    <Text>
-      {segs.map((seg, idx) => {
-        if (seg.type === 'text') return <Text key={idx}>{seg.text}</Text>;
-        if (seg.type === 'code') return <Text key={idx} color="cyan">{seg.text}</Text>;
-        if (seg.type === 'bold') return <Text key={idx} bold>{seg.text}</Text>;
-        if (seg.type === 'italic') return <Text key={idx} italic>{seg.text}</Text>;
-        if (seg.type === 'link') return <Text key={idx}><Text color="blue" underline>{seg.text}</Text><Text dimColor>{` (${seg.url})`}</Text></Text>;
-        return <Text key={idx}>{seg.text}</Text>;
-      })}
-    </Text>
-  );
+  return <Text>{out}</Text>;
 });
 
 // Types
@@ -414,7 +323,7 @@ const MessageBubble: React.FC<{ msg: Message }> = ({ msg }) => {
       return (
         <Box>
           <Text color="green" bold>🤖 Fry: </Text>
-          <MarkdownLine content={msg.content || ''} />
+          <MarkdownBlock content={msg.content || ''} />
         </Box>
       );
     case 'tool':
@@ -830,27 +739,6 @@ const ChatInterface: React.FC<{
             const updated = liveAssistantContentRef.current + delta.content;
             liveAssistantContentRef.current = updated;
             setLiveAssistantContent(updated);
-            // If we have any full lines, append them to static
-            let buf = liveAssistantContentRef.current;
-            let idx = buf.indexOf('\n');
-            if (idx !== -1) {
-              if (!assistantHeaderAppendedRef.current) {
-                appendTranscript(<Box><Text color="green" bold>🤖 Fry:</Text></Box>);
-                assistantHeaderAppendedRef.current = true;
-              }
-              while (idx !== -1) {
-                const line = buf.slice(0, idx);
-                const isFence = /^\s*```/.test(line);
-                appendTranscript(<Box><MarkdownLine content={line} inCodeBlock={assistantInCodeBlockRef.current} /></Box>);
-                if (isFence) {
-                  assistantInCodeBlockRef.current = !assistantInCodeBlockRef.current;
-                }
-                buf = buf.slice(idx + 1);
-                idx = buf.indexOf('\n');
-              }
-              liveAssistantContentRef.current = buf;
-              setLiveAssistantContent(buf);
-            }
             // Periodically yield to keep UI responsive
             const now = Date.now();
             if (now - lastYieldTime > 50) {
@@ -917,13 +805,13 @@ const ChatInterface: React.FC<{
           }
         }
 
-        // End of stream; flush any remaining partial line to static
-        if (liveAssistantContentRef.current.length > 0) {
+        // End of stream; append the full assistant message as one Markdown block
+        if ((assistantContent || '').length > 0) {
           if (!assistantHeaderAppendedRef.current) {
             appendTranscript(<Box><Text color="green" bold>🤖 Fry:</Text></Box>);
             assistantHeaderAppendedRef.current = true;
           }
-          appendTranscript(<Box><MarkdownLine content={liveAssistantContentRef.current} inCodeBlock={assistantInCodeBlockRef.current} /></Box>);
+          appendTranscript(<Box><MarkdownBlock content={assistantContent} /></Box>);
           liveAssistantContentRef.current = '';
           setLiveAssistantContent('');
         }
@@ -984,13 +872,13 @@ const ChatInterface: React.FC<{
       appendTranscript(<Text color="red">Error: {String(error)}</Text>);
     } finally {
       if (isInterruptedRef.current) {
-        // Flush partial line on interrupt
-        if (liveAssistantContentRef.current.length > 0) {
+        // Flush partial content on interrupt
+        if ((liveAssistantContentRef.current || '').length > 0) {
           if (!assistantHeaderAppendedRef.current) {
             appendTranscript(<Box><Text color="green" bold>🤖 Fry:</Text></Box>);
             assistantHeaderAppendedRef.current = true;
           }
-          appendTranscript(<Box><MarkdownLine content={liveAssistantContentRef.current} inCodeBlock={assistantInCodeBlockRef.current} /></Box>);
+          appendTranscript(<Box><MarkdownBlock content={liveAssistantContentRef.current} /></Box>);
           liveAssistantContentRef.current = '';
           setLiveAssistantContent('');
         }
@@ -1111,7 +999,7 @@ const ChatInterface: React.FC<{
         {isAssistantStreaming && (
           <Box flexDirection="column">
             <Text color="green" bold>🤖 Fry:</Text>
-            <MarkdownLine content={liveAssistantContent} inCodeBlock={assistantInCodeBlockRef.current} />
+            <MarkdownBlock content={liveAssistantContent} />
           </Box>
         )}
       </Box>
