@@ -18,7 +18,7 @@ Prompt: `Go through the web and extract data about recent advancements in LLM's.
 ![web_browsing](assets/web_browsing_test.gif)
 
 ### Coding/File browsing
-Prompt: `Go through `examples/gpt-oss` and explain how one can implement a chat interface with the model `gpt-oss`?`
+Prompt: ``Go through `examples/gpt-oss` and explain how one can implement a chat interface with the model `gpt-oss?`` `
 ![coding](assets/coding_test.gif)
 
 ## Requirements
