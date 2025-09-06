@@ -650,6 +650,9 @@ const ChatInterface: React.FC<{
         let assistantReasoning = '';
         const toolCalls: ToolCall[] = [];
         const toolAssembler: Map<number, ToolCall> = new Map();
+        // Fallback accumulator for servers that stream legacy function_call instead of tool_calls
+        let legacyFunctionCallName = '';
+        let legacyFunctionCallArgs = '';
 
         // Process chunks with periodic yielding to keep UI responsive
         let lastYieldTime = Date.now();
@@ -674,9 +677,20 @@ const ChatInterface: React.FC<{
               
               const existing = toolAssembler.get(tc.index)!;
               if (tc.id) existing.id = tc.id;
-              if (tc.function?.name) existing.function.name += tc.function.name;
+              if (tc.function?.name) {
+                // Function name typically arrives whole; avoid duplicating if streamed multiple times
+                if (!existing.function.name) existing.function.name = tc.function.name;
+              }
               if (tc.function?.arguments) existing.function.arguments += tc.function.arguments;
             }
+          }
+
+          // Some OpenAI-compatible servers emit the older function_call field when using tools.
+          // Accumulate it and later translate into a single tool_call entry if no tool_calls were provided.
+          const legacy = (delta as any).function_call;
+          if (legacy) {
+            if (typeof legacy.name === 'string') legacyFunctionCallName += legacy.name;
+            if (typeof legacy.arguments === 'string') legacyFunctionCallArgs += legacy.arguments;
           }
 
           if (delta.content) {
@@ -733,6 +747,17 @@ const ChatInterface: React.FC<{
         }
 
         toolCalls.push(...Array.from(toolAssembler.values()));
+        // If no tool_calls were streamed but a legacy function_call was, convert it.
+        if (toolCalls.length === 0 && (legacyFunctionCallName || legacyFunctionCallArgs)) {
+          toolCalls.push({
+            id: `call_${Math.random().toString(36).slice(2, 10)}`,
+            type: 'function',
+            function: {
+              name: legacyFunctionCallName || 'unknown',
+              arguments: legacyFunctionCallArgs || '{}'
+            }
+          });
+        }
         // toolCalls are assembled from delta.tool_calls only
         // Ensure each tool call has an id for tool message linking
         for (const tc of toolCalls) {
