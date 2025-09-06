@@ -23,23 +23,16 @@ const CHUNK_SIZE_TOKENS = 500;
 
 // Local Tool Executor
 export class LocalToolExecutor {
-  private workspaceDir: string = 'workspace';
+  // Root directory for all tool operations. Use the directory where fry-cli was launched.
+  private workspaceDir: string = process.cwd();
   private toolChunks: Map<string, string[]> = new Map();
 
   constructor() {
-    this.ensureWorkspace();
-  }
-
-  private async ensureWorkspace() {
-    try {
-      await fs.mkdir(this.workspaceDir, { recursive: true });
-    } catch (error) {
-      // Directory already exists
-    }
+    // No need to create the working directory; it already exists.
   }
 
   async getWorkspaceContents(maxChars: number = 4000): Promise<string> {
-    // Return ONLY the top-level listing of the workspace directory.
+    // Return ONLY the top-level listing of the working directory.
     // One item per line; directories end with '/'. No recursion.
     try {
       const dir = this.workspaceDir;
@@ -59,9 +52,9 @@ export class LocalToolExecutor {
         totalChars += line.length;
       }
 
-      return lines.length > 0 ? lines.join('\n') : 'Workspace is empty.';
+      return lines.length > 0 ? lines.join('\n') : 'Directory is empty.';
     } catch (error) {
-      return `Error reading workspace: ${error}`;
+      return `Error reading directory: ${error}`;
     }
   }
 
