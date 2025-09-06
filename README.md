@@ -1,7 +1,5 @@
 # Fry-CLI
 
-![test_prompt](assets/test_prompt.gif)
-
 `Fry` is a project to see how far [gpt-oss](https://huggingface.co/openai/gpt-oss-20b) can be pushed through prompt/tool definition formatting.
 
 ## Features
@@ -12,6 +10,14 @@
 - File system operations
 - File patching
 - Shell command execution
+
+## Example test
+
+### Web browsing
+![web_browsing](assets/web_browsing_test.gif)
+
+### Coding/File browsing
+![coding](assets/coding_test.gif)
 
 ## Requirements
 
