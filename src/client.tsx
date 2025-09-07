@@ -348,14 +348,14 @@ const ChatInterface: React.FC<{
   initialRateLimitStatus: RateLimitStatus | null;
   onResetSession: (data: SessionData) => void;
   showAnalysis: boolean;
-}> = ({ client, sessionData, modelEndpoint, modelName, initialRateLimitStatus, onResetSession, showAnalysis }) => {
+  streamChunks: boolean;
+  streamIntervalMs: number;
+}> = ({ client, sessionData, modelEndpoint, modelName, initialRateLimitStatus, onResetSession, showAnalysis, streamChunks, streamIntervalMs }) => {
   const { exit } = useApp();
   const [input, setInput] = useState('');
   // Append-only transcript using Ink's <Static> for scroll stability
   const [staticItems, setStaticItems] = useState<TranscriptItem[]>([]);
   const [isProcessing, setIsProcessing] = useState(false);
-  // Streaming state: we stream directly into transcript without a final commit
-  const [isAssistantStreaming, setIsAssistantStreaming] = useState(false);
   // Display tool execution as committed log entries instead of dynamic state
   const [rateLimitStatus, setRateLimitStatus] = useState<RateLimitStatus | null>(initialRateLimitStatus);
   const isInterruptedRef = useRef(false);
@@ -395,12 +395,10 @@ const ChatInterface: React.FC<{
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Streaming state: live content + header tracking
-  const [liveAssistantContent, setLiveAssistantContent] = useState<string>('');
+  // Streaming state: we only buffer in a ref to avoid re-renders
   const liveAssistantContentRef = useRef<string>('');
   const assistantHeaderAppendedRef = useRef<boolean>(false);
   const assistantInCodeBlockRef = useRef<boolean>(false);
-  useEffect(() => { liveAssistantContentRef.current = liveAssistantContent; }, [liveAssistantContent]);
 
   const executeToolCall = async (toolCall: ToolCall): Promise<ToolResult> => {
     const toolName = toolCall.function.name;
@@ -647,6 +645,8 @@ const ChatInterface: React.FC<{
     turnMessages.current = [{ role: 'user', content: userInput }];
     // Accumulate reasoning across tool-call loops until a final message is produced
     let accumulatedReasoning = '';
+    // Track how much of the current assistant buffer has been flushed (for streaming mode)
+    let lastFlushedIndex = 0;
     
     try {
       // Send the root directory listing (the directory where 'fry' was run)
@@ -677,14 +677,10 @@ const ChatInterface: React.FC<{
           extra_body: { add_generation_prompt: true, reasoning: { exclude: false } }
         });
 
-        // Begin assistant stream; render a header line and stream append-only chunks
-        setIsAssistantStreaming(true);
-        // No thinking timer; keep UI steady
-
-        // Initialize per-token streaming state
+        // Initialize per-token streaming state. We avoid UI re-renders during streaming
+        // and only append at a throttle interval (if enabled) or once at the end.
         assistantHeaderAppendedRef.current = false;
         assistantInCodeBlockRef.current = false;
-        setLiveAssistantContent('');
         liveAssistantContentRef.current = '';
 
         let assistantContent = '';
@@ -697,7 +693,8 @@ const ChatInterface: React.FC<{
 
         // Process chunks with periodic yielding to keep UI responsive
         let lastYieldTime = Date.now();
-        let lastUiUpdate = 0;
+        let lastFlushTime = 0;
+        let lastFlushedIndex = 0;
         for await (const chunk of stream) {
           if (isInterruptedRef.current) {
             break;
@@ -736,10 +733,63 @@ const ChatInterface: React.FC<{
 
           if (delta.content) {
             assistantContent += delta.content;
-            // Update live content
+            // Update buffered content without causing a re-render
             const updated = liveAssistantContentRef.current + delta.content;
             liveAssistantContentRef.current = updated;
-            setLiveAssistantContent(updated);
+            // If streaming is enabled, flush on interval as append-only chunks
+            if (streamChunks) {
+              const now = Date.now();
+              if (!assistantHeaderAppendedRef.current) {
+                appendTranscript(<Box><Text color="green" bold>🤖 Fry:</Text></Box>);
+                assistantHeaderAppendedRef.current = true;
+              }
+              if (now - lastFlushTime >= Math.max(50, streamIntervalMs || 200)) {
+                const buf = liveAssistantContentRef.current;
+                const lastNl = buf.lastIndexOf('\n');
+                if (lastNl >= lastFlushedIndex) {
+                  // Smart Markdown chunking
+                  const span = buf.slice(lastFlushedIndex, Math.max(lastFlushedIndex, lastNl));
+                  const lines = span.length > 0 ? span.split('\n') : [];
+                  // Track fenced code state within this span only
+                  let fence: '```' | '~~~' | null = null;
+                  for (const line of lines) {
+                    const m = line.match(/^\s*(```|~~~)/);
+                    if (m) {
+                      const marker = m[1] as '```' | '~~~';
+                      if (!fence) fence = marker; else if (fence === marker) fence = null;
+                    }
+                  }
+                  let safeFlushIdx = -1;
+                  if (!fence) {
+                    // Prefer paragraph boundary (blank line)
+                    const lastDouble = buf.lastIndexOf('\n\n', lastNl);
+                    if (lastDouble >= lastFlushedIndex) {
+                      // Flush up to the first of the two newlines to avoid extra blank lines
+                      safeFlushIdx = lastDouble + 1;
+                    } else {
+                      // List heuristics: avoid ending chunk on a bullet or its indented continuation
+                      const lastLineStart = buf.lastIndexOf('\n', lastNl - 1) + 1;
+                      const lastLine = buf.slice(lastLineStart, lastNl);
+                      const bulletRe = /^\s*(?:[-*+]\s+|\d+[.)]\s+)/;
+                      const prevLineStart = lastLineStart > 0 ? buf.lastIndexOf('\n', lastLineStart - 2) + 1 : lastFlushedIndex;
+                      const prevLine = buf.slice(prevLineStart, Math.max(prevLineStart, lastLineStart - 1));
+                      const isBullet = bulletRe.test(lastLine);
+                      const isContinuation = bulletRe.test(prevLine) && /^\s{2,}\S/.test(lastLine);
+                      if (!isBullet && !isContinuation) {
+                        safeFlushIdx = lastNl + 1;
+                      }
+                    }
+                  }
+                  if (safeFlushIdx > lastFlushedIndex) {
+                    let emit = buf.slice(lastFlushedIndex, safeFlushIdx);
+                    if (emit.endsWith('\n')) emit = emit.slice(0, -1);
+                    if (emit.length > 0) appendTranscript(<MarkdownBlock content={emit} />);
+                    lastFlushedIndex = safeFlushIdx;
+                    lastFlushTime = now;
+                  }
+                }
+              }
+            }
             // Periodically yield to keep UI responsive
             const now = Date.now();
             if (now - lastYieldTime > 50) {
@@ -812,11 +862,19 @@ const ChatInterface: React.FC<{
             appendTranscript(<Box><Text color="green" bold>🤖 Fry:</Text></Box>);
             assistantHeaderAppendedRef.current = true;
           }
-          appendTranscript(<Box><MarkdownBlock content={assistantContent} /></Box>);
+          if (streamChunks) {
+            // Flush only the remaining tail not yet appended
+            const remainder = liveAssistantContentRef.current.slice(lastFlushedIndex);
+            if (remainder.length > 0) {
+              appendTranscript(<MarkdownBlock content={remainder} />);
+              lastFlushedIndex = liveAssistantContentRef.current.length;
+            }
+          } else {
+            // Non-stream mode: append the entire content once
+            appendTranscript(<Box><MarkdownBlock content={assistantContent} /></Box>);
+          }
           liveAssistantContentRef.current = '';
-          setLiveAssistantContent('');
         }
-        setIsAssistantStreaming(false);
 
         turnMessages.current.push(assistantMessage);
         conversationHistory.current.push(assistantMessage);
@@ -874,19 +932,24 @@ const ChatInterface: React.FC<{
     } finally {
       if (isInterruptedRef.current) {
         // Flush partial content on interrupt
-        if ((liveAssistantContentRef.current || '').length > 0) {
+        const buffered = liveAssistantContentRef.current || '';
+        if (buffered.length > 0) {
           if (!assistantHeaderAppendedRef.current) {
             appendTranscript(<Box><Text color="green" bold>🤖 Fry:</Text></Box>);
             assistantHeaderAppendedRef.current = true;
           }
-          appendTranscript(<Box><MarkdownBlock content={liveAssistantContentRef.current} /></Box>);
+          if (streamChunks) {
+            // Only flush the unflushed tail
+            const tail = buffered.slice(lastFlushedIndex);
+            if (tail.length > 0) appendTranscript(<MarkdownBlock content={tail} />);
+          } else {
+            appendTranscript(<Box><MarkdownBlock content={buffered} /></Box>);
+          }
           liveAssistantContentRef.current = '';
-          setLiveAssistantContent('');
         }
         appendTranscript(<Text color="yellow">✗ Response interrupted by user.</Text>);
       }
       // End of turn
-      setIsAssistantStreaming(false);
       setIsProcessing(false);
     }
   };
@@ -907,7 +970,7 @@ const ChatInterface: React.FC<{
       try {
         setIsProcessing(true);
         isInterruptedRef.current = false;
-        setIsAssistantStreaming(false);
+        // streaming preview disabled; nothing to reset here
         // No timers to clear
         turnMessages.current = [];
         conversationHistory.current = [];
@@ -995,14 +1058,8 @@ const ChatInterface: React.FC<{
     <Box flexDirection="column">
       <Box flexDirection="column">
         <Static items={staticItems as React.ReactNode[]}>
-          {(item, i) => <Box key={i}>{item}</Box>}
+          {(item, i) => <React.Fragment key={i}>{item}</React.Fragment>}
         </Static>
-        {isAssistantStreaming && (
-          <Box flexDirection="column">
-            <Text color="green" bold>🤖 Fry:</Text>
-            <MarkdownBlock content={liveAssistantContent} />
-          </Box>
-        )}
       </Box>
 
       {!isProcessing && (
@@ -1156,7 +1213,7 @@ const ApiKeyInput: React.FC<{ backendUrl: string; onAuthenticated: (sessionRespo
 };
 
 // Main App Component
-const App: React.FC<{ backendUrl: string; modelName: string; showAnalysis: boolean }> = ({ backendUrl, modelName, showAnalysis }) => {
+const App: React.FC<{ backendUrl: string; modelName: string; showAnalysis: boolean; streamChunks: boolean; streamIntervalMs: number }> = ({ backendUrl, modelName, showAnalysis, streamChunks, streamIntervalMs }) => {
   const [stage, setStage] = useState<'endpoint' | 'auth' | 'chat'>('endpoint');
   const [modelEndpoint, setModelEndpoint] = useState<string | null>(null);
   const [sessionData, setSessionData] = useState<SessionData | null>(null);
@@ -1205,6 +1262,8 @@ const App: React.FC<{ backendUrl: string; modelName: string; showAnalysis: boole
           modelName={modelName}
           initialRateLimitStatus={initialRateLimit}
           showAnalysis={showAnalysis}
+          streamChunks={streamChunks}
+          streamIntervalMs={streamIntervalMs}
           onResetSession={(data) => {
             setSessionData(data);
             // Reset initial rate limit display; ChatInterface also tracks its own status
@@ -1224,6 +1283,8 @@ const cli = meow(`
     --backend, -b  Backend URL (default: https://frycli.share.zrok.io)
     --model, -m    Model name (default: gpt-4)
     --show-analysis, -a  Show chain-of-thought (default: true)
+    --stream, -s   Stream assistant output in throttled append-only chunks (default: false)
+    --stream-interval  Interval in ms for streaming chunks (default: 200)
     --no-update     Skip automatic update check
 
   Examples
@@ -1246,6 +1307,15 @@ const cli = meow(`
       shortFlag: 'a',
       default: true
     },
+    stream: {
+      type: 'boolean',
+      shortFlag: 's',
+      default: true
+    },
+    streamInterval: {
+      type: 'number',
+      default: 200
+    },
     noUpdate: {
       type: 'boolean',
       default: false
@@ -1265,6 +1335,8 @@ render(
     backendUrl={cli.flags.backend}
     modelName={cli.flags.model}
     showAnalysis={Boolean(cli.flags.showAnalysis)}
+    streamChunks={Boolean(cli.flags.stream)}
+    streamIntervalMs={Number.isFinite(cli.flags.streamInterval) ? Number(cli.flags.streamInterval) : 200}
   />,
   { exitOnCtrlC: false }
 );
