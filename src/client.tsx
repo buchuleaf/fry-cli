@@ -366,6 +366,9 @@ const ChatInterface: React.FC<{
   const readChunkLineCountsRef = useRef<Map<string, Map<number, number>>>(new Map());
   // Track last chunk index served per tool_call_id so we can infer the next chunk
   const readChunkLastIdxRef = useRef<Map<string, number>>(new Map());
+  // Track origin of chunked outputs by the original tool_call_id
+  // Used to decide whether to add line numbers on subsequent read_chunk calls
+  const chunkOriginRef = useRef<Map<string, { toolName: string; action?: string }>>(new Map());
   const openaiClient = useRef(new OpenAI({
     baseURL: modelEndpoint,
     apiKey: 'dummy'
@@ -399,6 +402,9 @@ const ChatInterface: React.FC<{
   const liveAssistantContentRef = useRef<string>('');
   const assistantHeaderAppendedRef = useRef<boolean>(false);
   const assistantInCodeBlockRef = useRef<boolean>(false);
+  // Live preview shown during streaming (single dynamic block to avoid scroll yank)
+  const [livePreview, setLivePreview] = useState<string>('');
+  const [showLivePreview, setShowLivePreview] = useState<boolean>(false);
 
   const executeToolCall = async (toolCall: ToolCall): Promise<ToolResult> => {
     const toolName = toolCall.function.name;
@@ -519,6 +525,17 @@ const ChatInterface: React.FC<{
       }
     }
 
+    // Remember origin of chunked outputs so we know what read_chunk refers to later
+    const isLargeOutputNotice = typeof result.data === 'string' && resultText.startsWith('Output is too large');
+    if (isLargeOutputNotice) {
+      try {
+        const argsObj = JSON.parse(toolCall.function.arguments || '{}');
+        const action = (argsObj.action || '').toLowerCase();
+        // Map the original tool_call_id (this call) to its origin details
+        chunkOriginRef.current.set(toolCall.id, { toolName, action });
+      } catch {}
+    }
+
     // Add line numbers when reading file content
     let isReadTool = false;
     let isReadChunk = false;
@@ -533,8 +550,23 @@ const ChatInterface: React.FC<{
         isReadChunk = toolName === 'fs.read_chunk';
       }
     } catch {}
-    const isLargeOutputNotice = typeof result.data === 'string' && resultText.startsWith('Output is too large');
-    if (isReadTool && !isLargeOutputNotice) {
+    // Only number read_chunk responses if the original chunked output came from a file read
+    let shouldNumber = isReadTool && !isLargeOutputNotice;
+    if (shouldNumber && isReadChunk) {
+      try {
+        const argsObj = JSON.parse(toolCall.function.arguments || '{}');
+        const callId: string | undefined = argsObj.tool_call_id;
+        if (callId) {
+          const origin = chunkOriginRef.current.get(callId);
+          const originIsRead = !!origin && (
+            (origin.toolName === 'workspace' && origin.action === 'read') ||
+            origin.toolName === 'fs.read'
+          );
+          if (!originIsRead) shouldNumber = false;
+        }
+      } catch {}
+    }
+    if (shouldNumber) {
       // fs.read (small files) or fs.read_chunk (single chunk). For fs.read_chunk,
       // keep numbering continuous by using stored counts for earlier chunks.
       const lines = resultText.split('\n');
@@ -645,8 +677,6 @@ const ChatInterface: React.FC<{
     turnMessages.current = [{ role: 'user', content: userInput }];
     // Accumulate reasoning across tool-call loops until a final message is produced
     let accumulatedReasoning = '';
-    // Track how much of the current assistant buffer has been flushed (for streaming mode)
-    let lastFlushedIndex = 0;
     
     try {
       // Send the root directory listing (the directory where 'fry' was run)
@@ -694,7 +724,26 @@ const ChatInterface: React.FC<{
         // Process chunks with periodic yielding to keep UI responsive
         let lastYieldTime = Date.now();
         let lastFlushTime = 0;
-        let lastFlushedIndex = 0;
+
+        // Build a balanced Markdown preview without mutating history. If a fenced
+        // code block is open at the end, temporarily append a closing fence so the
+        // preview renders correctly; on the next delta, the preview is re-rendered.
+        const balancedPreview = (md: string): string => {
+          let marker: '```' | '~~~' | null = null;
+          const lines = md.split('\n');
+          for (const line of lines) {
+            const m = line.match(/^\s*(```|~~~)/);
+            if (m) {
+              const cur = m[1] as '```' | '~~~';
+              if (!marker) marker = cur; else if (marker === cur) marker = null;
+            }
+          }
+          if (marker) {
+            if (!md.endsWith('\n')) md += '\n';
+            md += marker;
+          }
+          return md;
+        };
         for await (const chunk of stream) {
           if (isInterruptedRef.current) {
             break;
@@ -736,68 +785,18 @@ const ChatInterface: React.FC<{
             // Update buffered content without causing a re-render
             const updated = liveAssistantContentRef.current + delta.content;
             liveAssistantContentRef.current = updated;
-            // If streaming is enabled, flush on interval as append-only chunks
+            // If streaming is enabled, update the single live preview on-every-delta
             if (streamChunks) {
               const now = Date.now();
               if (!assistantHeaderAppendedRef.current) {
                 appendTranscript(<Box><Text color="green" bold>🤖 Fry:</Text></Box>);
                 assistantHeaderAppendedRef.current = true;
+                setShowLivePreview(true);
               }
-              if (now - lastFlushTime >= Math.max(50, streamIntervalMs || 200)) {
-                const buf = liveAssistantContentRef.current;
-                const lastNl = buf.lastIndexOf('\n');
-                if (lastNl >= lastFlushedIndex) {
-                  // Smart Markdown chunking
-                  const span = buf.slice(lastFlushedIndex, Math.max(lastFlushedIndex, lastNl));
-                  const lines = span.length > 0 ? span.split('\n') : [];
-                  // Track fenced code state within this span only
-                  let fence: '```' | '~~~' | null = null;
-                  for (const line of lines) {
-                    const m = line.match(/^\s*(```|~~~)/);
-                    if (m) {
-                      const marker = m[1] as '```' | '~~~';
-                      if (!fence) fence = marker; else if (fence === marker) fence = null;
-                    }
-                  }
-                  let safeFlushIdx = -1;
-                  if (!fence) {
-                    // Prefer paragraph boundary (blank line)
-                  const lastDouble = buf.lastIndexOf('\n\n', lastNl);
-                  if (lastDouble >= lastFlushedIndex) {
-                    // Prefer paragraph boundary. Consume both newlines for the buffer index,
-                    // but emit only one to avoid creating two blank lines after rendering.
-                    const emitEnd = lastDouble + 1; // include one newline in emitted chunk
-                    safeFlushIdx = lastDouble + 2;   // advance past both newlines in the buffer
-                    let emit = buf.slice(lastFlushedIndex, emitEnd);
-                    if (emit.length > 0) appendTranscript(<MarkdownBlock content={emit} />);
-                    lastFlushedIndex = safeFlushIdx;
-                    lastFlushTime = now;
-                    // We've already emitted; skip the generic emission below
-                    continue;
-                  } else {
-                    // List heuristics: avoid ending chunk on a bullet or its indented continuation
-                    const lastLineStart = buf.lastIndexOf('\n', lastNl - 1) + 1;
-                    const lastLine = buf.slice(lastLineStart, lastNl);
-                    const bulletRe = /^\s*(?:[-*+]\s+|\d+[.)]\s+)/;
-                    const prevLineStart = lastLineStart > 0 ? buf.lastIndexOf('\n', lastLineStart - 2) + 1 : lastFlushedIndex;
-                    const prevLine = buf.slice(prevLineStart, Math.max(prevLineStart, lastLineStart - 1));
-                    const isBullet = bulletRe.test(lastLine);
-                    const isContinuation = bulletRe.test(prevLine) && /^\s{2,}\S/.test(lastLine);
-                    if (!isBullet && !isContinuation) {
-                      safeFlushIdx = lastNl + 1;
-                    }
-                  }
-                  }
-                  if (safeFlushIdx > lastFlushedIndex) {
-                    // Generic line flush: emit without the trailing single newline to avoid
-                    // marked-terminal treating it as an end-of-paragraph and adding an extra blank line.
-                    let emit = buf.slice(lastFlushedIndex, safeFlushIdx);
-                    if (emit.endsWith('\n')) emit = emit.slice(0, -1);
-                    if (emit.length > 0) appendTranscript(<MarkdownBlock content={emit} />);
-                    lastFlushedIndex = safeFlushIdx;
-                    lastFlushTime = now;
-                  }
-                }
+              const shouldUpdate = (streamIntervalMs ?? 0) <= 0 || (now - lastFlushTime >= streamIntervalMs);
+              if (shouldUpdate) {
+                setLivePreview(balancedPreview(liveAssistantContentRef.current));
+                lastFlushTime = now;
               }
             }
             // Periodically yield to keep UI responsive
@@ -872,17 +871,11 @@ const ChatInterface: React.FC<{
             appendTranscript(<Box><Text color="green" bold>🤖 Fry:</Text></Box>);
             assistantHeaderAppendedRef.current = true;
           }
-          if (streamChunks) {
-            // Flush only the remaining tail not yet appended
-            const remainder = liveAssistantContentRef.current.slice(lastFlushedIndex);
-            if (remainder.length > 0) {
-              appendTranscript(<MarkdownBlock content={remainder} />);
-              lastFlushedIndex = liveAssistantContentRef.current.length;
-            }
-          } else {
-            // Non-stream mode: append the entire content once
-            appendTranscript(<Box><MarkdownBlock content={assistantContent} /></Box>);
-          }
+          // Collapse the streaming preview into a single consolidated Markdown block
+          appendTranscript(<Box><MarkdownBlock content={assistantContent} /></Box>);
+          // Hide the live preview now that the final content is appended
+          setShowLivePreview(false);
+          setLivePreview('');
           liveAssistantContentRef.current = '';
         }
 
@@ -948,14 +941,12 @@ const ChatInterface: React.FC<{
             appendTranscript(<Box><Text color="green" bold>🤖 Fry:</Text></Box>);
             assistantHeaderAppendedRef.current = true;
           }
-          if (streamChunks) {
-            // Only flush the unflushed tail
-            const tail = buffered.slice(lastFlushedIndex);
-            if (tail.length > 0) appendTranscript(<MarkdownBlock content={tail} />);
-          } else {
-            appendTranscript(<Box><MarkdownBlock content={buffered} /></Box>);
-          }
+          // Append the partial content as a single block
+          appendTranscript(<Box><MarkdownBlock content={buffered} /></Box>);
           liveAssistantContentRef.current = '';
+          // Hide any live preview
+          setShowLivePreview(false);
+          setLivePreview('');
         }
         appendTranscript(<Text color="yellow">✗ Response interrupted by user.</Text>);
       }
@@ -1071,6 +1062,12 @@ const ChatInterface: React.FC<{
           {(item, i) => <React.Fragment key={i}>{item}</React.Fragment>}
         </Static>
       </Box>
+
+      {isProcessing && showLivePreview && (
+        <Box>
+          <MarkdownBlock content={livePreview} />
+        </Box>
+      )}
 
       {!isProcessing && (
         <Box>
@@ -1293,8 +1290,8 @@ const cli = meow(`
     --backend, -b  Backend URL (default: https://frycli.share.zrok.io)
     --model, -m    Model name (default: gpt-4)
     --show-analysis, -a  Show chain-of-thought (default: true)
-    --stream, -s   Stream assistant output in throttled append-only chunks (default: false)
-    --stream-interval  Interval in ms for streaming chunks (default: 200)
+    --stream, -s   Stream assistant output as tokens arrive (default: true)
+    --stream-interval  Interval in ms for streaming chunks; set to 0 for flush-on-every-delta (default: 0)
     --no-update     Skip automatic update check
 
   Examples
@@ -1324,7 +1321,7 @@ const cli = meow(`
     },
     streamInterval: {
       type: 'number',
-      default: 200
+      default: 0
     },
     noUpdate: {
       type: 'boolean',
@@ -1346,7 +1343,7 @@ render(
     modelName={cli.flags.model}
     showAnalysis={Boolean(cli.flags.showAnalysis)}
     streamChunks={Boolean(cli.flags.stream)}
-    streamIntervalMs={Number.isFinite(cli.flags.streamInterval) ? Number(cli.flags.streamInterval) : 200}
+    streamIntervalMs={Number.isFinite(cli.flags.streamInterval) ? Number(cli.flags.streamInterval) : 0}
   />,
   { exitOnCtrlC: false }
 );
