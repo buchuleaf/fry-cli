@@ -629,7 +629,7 @@ const ChatInterface: React.FC<{
       .join('\n');
 
     appendTranscript(
-      <Box flexDirection="column">
+      <Box flexDirection="column" marginBottom={1}>
         <Text dimColor>[{toolName}] {result.status}:</Text>
         <Text>{indented}</Text>
       </Box>
@@ -1035,7 +1035,7 @@ const ChatInterface: React.FC<{
     }
 
     appendTranscript(
-      <Box flexDirection="column">
+      <Box flexDirection="column" marginBottom={1}>
         <Text color="blue" bold>👤 You:</Text>
         <Text>{userInput}</Text>
       </Box>
