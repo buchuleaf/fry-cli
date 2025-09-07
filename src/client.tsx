@@ -762,27 +762,35 @@ const ChatInterface: React.FC<{
                   let safeFlushIdx = -1;
                   if (!fence) {
                     // Prefer paragraph boundary (blank line)
-                    const lastDouble = buf.lastIndexOf('\n\n', lastNl);
-                    if (lastDouble >= lastFlushedIndex) {
-                      // Flush up to the first of the two newlines to avoid extra blank lines
-                      safeFlushIdx = lastDouble + 1;
-                    } else {
-                      // List heuristics: avoid ending chunk on a bullet or its indented continuation
-                      const lastLineStart = buf.lastIndexOf('\n', lastNl - 1) + 1;
-                      const lastLine = buf.slice(lastLineStart, lastNl);
-                      const bulletRe = /^\s*(?:[-*+]\s+|\d+[.)]\s+)/;
-                      const prevLineStart = lastLineStart > 0 ? buf.lastIndexOf('\n', lastLineStart - 2) + 1 : lastFlushedIndex;
-                      const prevLine = buf.slice(prevLineStart, Math.max(prevLineStart, lastLineStart - 1));
-                      const isBullet = bulletRe.test(lastLine);
-                      const isContinuation = bulletRe.test(prevLine) && /^\s{2,}\S/.test(lastLine);
-                      if (!isBullet && !isContinuation) {
-                        safeFlushIdx = lastNl + 1;
-                      }
+                  const lastDouble = buf.lastIndexOf('\n\n', lastNl);
+                  if (lastDouble >= lastFlushedIndex) {
+                    // Prefer paragraph boundary. Consume both newlines for the buffer index,
+                    // but emit only one to avoid creating two blank lines after rendering.
+                    const emitEnd = lastDouble + 1; // include one newline in emitted chunk
+                    safeFlushIdx = lastDouble + 2;   // advance past both newlines in the buffer
+                    let emit = buf.slice(lastFlushedIndex, emitEnd);
+                    if (emit.length > 0) appendTranscript(<MarkdownBlock content={emit} />);
+                    lastFlushedIndex = safeFlushIdx;
+                    lastFlushTime = now;
+                    // We've already emitted; skip the generic emission below
+                    continue;
+                  } else {
+                    // List heuristics: avoid ending chunk on a bullet or its indented continuation
+                    const lastLineStart = buf.lastIndexOf('\n', lastNl - 1) + 1;
+                    const lastLine = buf.slice(lastLineStart, lastNl);
+                    const bulletRe = /^\s*(?:[-*+]\s+|\d+[.)]\s+)/;
+                    const prevLineStart = lastLineStart > 0 ? buf.lastIndexOf('\n', lastLineStart - 2) + 1 : lastFlushedIndex;
+                    const prevLine = buf.slice(prevLineStart, Math.max(prevLineStart, lastLineStart - 1));
+                    const isBullet = bulletRe.test(lastLine);
+                    const isContinuation = bulletRe.test(prevLine) && /^\s{2,}\S/.test(lastLine);
+                    if (!isBullet && !isContinuation) {
+                      safeFlushIdx = lastNl + 1;
                     }
                   }
+                  }
                   if (safeFlushIdx > lastFlushedIndex) {
-                    let emit = buf.slice(lastFlushedIndex, safeFlushIdx);
-                    if (emit.endsWith('\n')) emit = emit.slice(0, -1);
+                    // Generic line flush: emit up to and including the newline
+                    const emit = buf.slice(lastFlushedIndex, safeFlushIdx);
                     if (emit.length > 0) appendTranscript(<MarkdownBlock content={emit} />);
                     lastFlushedIndex = safeFlushIdx;
                     lastFlushTime = now;
