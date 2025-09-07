@@ -166,10 +166,11 @@ async function maybeSelfUpdate(opts?: { skip?: boolean, timeoutMs?: number }) {
 
 // Full Markdown renderer using marked + marked-terminal (ANSI output)
 // Configure once at module load
+// Disable reflow to avoid inserting artificial line breaks; let Ink handle wrapping.
 try {
   const width = Math.max(40, Math.min(process.stdout?.columns || 80, 120));
   marked.use((markedTerminal as any)({
-    reflowText: true,
+    reflowText: false,
     width,
     tab: 2,
     unescape: true
