@@ -789,8 +789,10 @@ const ChatInterface: React.FC<{
                   }
                   }
                   if (safeFlushIdx > lastFlushedIndex) {
-                    // Generic line flush: emit up to and including the newline
-                    const emit = buf.slice(lastFlushedIndex, safeFlushIdx);
+                    // Generic line flush: emit without the trailing single newline to avoid
+                    // marked-terminal treating it as an end-of-paragraph and adding an extra blank line.
+                    let emit = buf.slice(lastFlushedIndex, safeFlushIdx);
+                    if (emit.endsWith('\n')) emit = emit.slice(0, -1);
                     if (emit.length > 0) appendTranscript(<MarkdownBlock content={emit} />);
                     lastFlushedIndex = safeFlushIdx;
                     lastFlushTime = now;
