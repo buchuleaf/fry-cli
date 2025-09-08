@@ -521,10 +521,17 @@ const ChatInterface: React.FC<{
       let startLine = 1;
       try {
         const argsObj = JSON.parse(toolCall.function.arguments || '{}');
-        const maybeStart = Number(argsObj.start_line);
-        if (Number.isFinite(maybeStart) && maybeStart > 0) {
-          startLine = Math.floor(maybeStart);
+        const parseNum = (v: any) => {
+          const n = Number(v);
+          return Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
+        };
+        // Prefer explicit start_line, then line_start, then lines="A..B"
+        let s = parseNum(argsObj.start_line) ?? parseNum(argsObj.line_start);
+        if (!s && typeof argsObj.lines === 'string') {
+          const m = String(argsObj.lines).trim().match(/^(\d+)\s*(?:\.{2}|-|:)\s*(\d+)$/);
+          if (m) s = parseNum(m[1]);
         }
+        if (s) startLine = s;
       } catch {}
       const width = String(startLine + lines.length - 1).length;
       resultText = lines
