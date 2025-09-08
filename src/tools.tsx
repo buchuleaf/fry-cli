@@ -20,6 +20,8 @@ export interface ToolResult {
 }
 
 const CHUNK_SIZE_TOKENS = 500;
+// Default number of lines to return when only start_line is provided
+const DEFAULT_LINE_WINDOW = 40;
 
 // Local Tool Executor
 export class LocalToolExecutor {
@@ -85,6 +87,7 @@ export class LocalToolExecutor {
       `  - workspace(action='read_chunk', tool_call_id='${toolCallId}', start_line=<start>, end_line=<end>)\n` +
       `  - workspace(action='read_chunk', tool_call_id='${toolCallId}', lines='START..END')\n` +
       `  - or directly: workspace(action='read_chunk', path='<file>', start_line=<start>, end_line=<end>)\n` +
+      `  - or directly: workspace(action='read_chunk', path='<file>', lines='START..END')\n` +
       `  - note: if tool_call_id is omitted, the latest chunked result is used.`;
     const decoratedPreview = `\n\nFirst chunk (0/${chunks.length - 1}):\n${preview}`;
     return {
@@ -569,6 +572,7 @@ export class LocalToolExecutor {
     // Collect possible line-range fields
     let startLine = parseNum(args.start_line ?? args.line_start);
     let endLine = parseNum(args.end_line ?? args.line_end);
+    const lineCount = parseNum(args.count ?? args.line_count);
     if (!startLine && typeof args.lines === 'string') {
       const got = parseLinesSpec(args.lines);
       startLine = got.start ?? startLine;
@@ -582,8 +586,10 @@ export class LocalToolExecutor {
         const fullText = (chunks as string[]).join('');
         const allLines = fullText.split('\n');
         const totalLines = allLines.length;
+        // If end_line is omitted, default to a small or requested window of lines
         if (!endLine) {
-          return { status: 'error', data: "Missing 'end_line'. Provide both start_line and end_line." };
+          const window = lineCount ?? DEFAULT_LINE_WINDOW;
+          endLine = Math.min((startLine as number) + window - 1, totalLines);
         }
         if (startLine < 1 || startLine > totalLines) {
           return { status: 'error', data: `start_line out of range. Valid: 1..${totalLines}` };
@@ -607,8 +613,10 @@ export class LocalToolExecutor {
           const fullText = await fs.readFile(safePath, 'utf-8');
           const allLines = fullText.split('\n');
           const totalLines = allLines.length;
+          // If end_line is omitted, default to a small or requested window of lines
           if (!endLine) {
-            return { status: 'error', data: "Missing 'end_line'. Provide both start_line and end_line." };
+            const window = lineCount ?? DEFAULT_LINE_WINDOW;
+            endLine = Math.min((startLine as number) + window - 1, totalLines);
           }
           if (startLine < 1 || startLine > totalLines) {
             return { status: 'error', data: `start_line out of range. Valid: 1..${totalLines}` };
