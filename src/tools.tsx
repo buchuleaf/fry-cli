@@ -20,18 +20,14 @@ export interface ToolResult {
 }
 
 const CHUNK_SIZE_TOKENS = 500;
-// Default number of lines to return when only start_line is provided
-const DEFAULT_LINE_WINDOW = 40;
+// File read defaults and limits
+const DEFAULT_READ_WINDOW = 50; // default lines when end_line not provided
+const MAX_READ_LINES = 200;     // hard limit per call
 
 // Local Tool Executor
 export class LocalToolExecutor {
   // Root directory for all tool operations. Use the directory where fry-cli was launched.
   private workspaceDir: string = process.cwd();
-  private toolChunks: Map<string, string[]> = new Map();
-  // Track the last-served chunk index per tool_call_id for read_chunk defaults
-  private lastServedChunk: Map<string, number> = new Map();
-  // Remember the most recent tool_call_id that produced chunked output (for implicit read_chunk)
-  private lastChunkedToolCallId: string | null = null;
 
   constructor() {}
 
@@ -41,7 +37,7 @@ export class LocalToolExecutor {
     return fullPath.startsWith(workspaceRoot) ? fullPath : null;
   }
 
-  private chunkContent(content: string, toolCallId: string, opts?: { lineSafe?: boolean }): ToolResult {
+  private chunkContent(content: string, _toolCallId: string, opts?: { lineSafe?: boolean }): ToolResult {
     // Simple heuristic for token counting: 1 token ~ 4 characters
     const charLimit = CHUNK_SIZE_TOKENS * 4;
 
@@ -49,50 +45,15 @@ export class LocalToolExecutor {
       return { status: 'success', data: content };
     }
 
-    const chunks: string[] = [];
+    // Truncate output for display. If lineSafe, cut at the last full line within limit.
+    let cut = charLimit;
     if (opts?.lineSafe) {
-      // Ensure we end chunks on full-line boundaries when desired.
-      let i = 0;
-      while (i < content.length) {
-        let end = Math.min(i + charLimit, content.length);
-        if (end < content.length) {
-          // Advance to the next newline so the last line of the chunk is complete.
-          const nextNewline = content.indexOf('\n', end);
-          if (nextNewline !== -1) {
-            end = nextNewline + 1; // include the newline in this chunk
-          } else {
-            end = content.length; // no more newlines; take the rest
-          }
-        }
-        chunks.push(content.slice(i, end));
-        i = end;
-      }
-    } else {
-      for (let i = 0; i < content.length; i += charLimit) {
-        chunks.push(content.substring(i, i + charLimit));
-      }
+      const idx = content.lastIndexOf('\n', charLimit);
+      if (idx > 0) cut = idx + 1;
     }
-    
-    this.toolChunks.set(toolCallId, chunks);
-    // Since we include the first chunk inline in the preview, initialize last-served to 0
-    this.lastServedChunk.set(toolCallId, 0);
-    // Track this as the latest chunked output for implicit follow-ups
-    this.lastChunkedToolCallId = toolCallId;
-
-    // Return the standard notice plus the first chunk inline so the model
-    // does not need to call read_chunk for an initial preview.
-    const preview = chunks[0] ?? '';
-    const header = `Output is too large and has been split into ${chunks.length} chunks. Continue by:\n` +
-      `  - fs.read_chunk({ tool_call_id: '${toolCallId}', chunk: <0..${chunks.length - 1}> })\n` +
-      `  - fs.read_chunk({ tool_call_id: '${toolCallId}', start_line: <start>, end_line: <end> })\n` +
-      `  - fs.read_chunk({ tool_call_id: '${toolCallId}', lines: 'START..END' })\n` +
-      `  - or directly: fs.read_chunk({ path: '<file>', start_line: <start>, end_line: <end> })\n` +
-      `  - or directly: fs.read_chunk({ path: '<file>', lines: 'START..END' })`;
-    const decoratedPreview = `\n\nFirst chunk (0/${chunks.length - 1}):\n${preview}`;
-    return {
-      status: 'success',
-      data: header + decoratedPreview
-    };
+    const preview = content.slice(0, cut);
+    const header = `Output truncated. Showing first ${cut} of ${content.length} characters. Refine your command or filter to reduce output.`;
+    return { status: 'success', data: `${header}\n\n${preview}` };
   }
 
   async execute(toolCall: ToolCall): Promise<ToolResult> {
@@ -146,7 +107,7 @@ export class LocalToolExecutor {
       case 'ls':
         return this.handleLs({ path: args.path || '.' }, toolCallId);
       case 'read':
-        return this.handleRead({ path: args.path }, toolCallId);
+        return this.handleRead({ path: args.path, start_line: args.start_line, end_line: args.end_line }, toolCallId);
       case 'write':
         return this.handleWrite({ path: args.path, content: args.content });
       case 'mkdir':
@@ -155,18 +116,10 @@ export class LocalToolExecutor {
         return this.handleSearchFiles({ pattern: args.pattern, file_pattern: args.file_pattern, path: args.path }, toolCallId);
       case 'apply_patch':
         return this.handleApplyPatch({ patch: args.patch });
-      case 'read_chunk':
-        // Forward all supported addressing modes: chunk index OR explicit line ranges
-        return this.handleReadChunk({
-          tool_call_id: args.tool_call_id,
-          chunk: args.chunk,
-          start_line: args.start_line ?? args.line_start,
-          end_line: args.end_line ?? args.line_end,
-          lines: args.lines,
-          path: args.path
-        });
+      // No 'read_chunk' action in simplified API
+      // fallthrough
       default:
-        return { status: 'error', data: "Unknown or missing 'action'. Use one of: ls, read, write, mkdir, search_files, apply_patch, read_chunk." };
+        return { status: 'error', data: "Unknown or missing 'action'. Use one of: ls, read, write, mkdir, search_files, apply_patch." };
     }
   }
 
@@ -347,8 +300,6 @@ export class LocalToolExecutor {
         return await this.handleSearchFiles(args, toolCallId);
       case 'apply_patch':
         return await this.handleApplyPatch(args);
-      case 'read_chunk':
-        return await this.handleReadChunk(args);
       default:
         return { status: 'error', data: `Unknown fs command: ${command}` };
     }
@@ -390,23 +341,47 @@ export class LocalToolExecutor {
     }
   }
 
-  private async handleRead(args: any, toolCallId: string): Promise<ToolResult> {
+  private async handleRead(args: any, _toolCallId: string): Promise<ToolResult> {
     const pathArg = args.path;
     if (!pathArg) return { status: 'error', data: 'read requires a path.' };
 
     const safePath = this.getSafePath(pathArg);
     if (!safePath) return { status: 'error', data: 'Access denied.' };
 
+    const parseIntSafe = (v: any): number | undefined => {
+      const n = Number(v);
+      return Number.isInteger(n) && n > 0 ? n : undefined;
+    };
+
+    let startLine = parseIntSafe(args.start_line) ?? 1;
+    let endLine = parseIntSafe(args.end_line);
+
     try {
       const stats = await fs.stat(safePath);
-      if (!stats.isFile()) {
-        return { status: 'error', data: 'Not a file.' };
+      if (!stats.isFile()) return { status: 'error', data: 'Not a file.' };
+
+      const fullText = await fs.readFile(safePath, 'utf-8');
+      const allLines = fullText.split('\n');
+      const totalLines = allLines.length;
+
+      if (!endLine) {
+        endLine = startLine + DEFAULT_READ_WINDOW - 1;
+      }
+      // Enforce maximum window size
+      if (endLine - startLine + 1 > MAX_READ_LINES) {
+        endLine = startLine + MAX_READ_LINES - 1;
       }
 
-      const content = await fs.readFile(safePath, 'utf-8');
-      // When reading files (often code), keep chunks aligned to full lines
-      // so the last line in each chunk is not truncated.
-      return this.chunkContent(content, toolCallId, { lineSafe: true });
+      if (startLine < 1 || startLine > totalLines) {
+        return { status: 'error', data: `start_line out of range. Valid: 1..${totalLines}` };
+      }
+      if (endLine < startLine) {
+        return { status: 'error', data: 'end_line must be >= start_line.' };
+      }
+      if (endLine > totalLines) endLine = totalLines;
+
+      const slice = allLines.slice(startLine - 1, endLine).join('\n');
+      return { status: 'success', data: slice };
     } catch (error) {
       return { status: 'error', data: `Error reading file: ${error}` };
     }
@@ -549,113 +524,7 @@ export class LocalToolExecutor {
     }
   }
 
-  private async handleReadChunk(args: any): Promise<ToolResult> {
-    const idLike = args.tool_call_id ?? args.call_id ?? args.chunk_id ?? this.lastChunkedToolCallId ?? undefined;
-    const toolCallId: string | undefined = typeof idLike === 'string' && idLike.trim().length > 0 ? idLike : undefined;
-    let chunks = toolCallId ? this.toolChunks.get(toolCallId) : undefined;
-    const hasChunks = Array.isArray(chunks) && chunks.length > 0;
-
-    // Optional line-range mode
-    const parseNum = (v: any): number | undefined => {
-      const n = Number(v);
-      return Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
-    };
-    const parseLinesSpec = (s: string): { start?: number, end?: number } => {
-      const m = String(s).trim().match(/^(\d+)\s*(?:\.{2}|-|:)\s*(\d+)$/);
-      if (m) {
-        const a = parseNum(m[1]);
-        const b = parseNum(m[2]);
-        return { start: a, end: b };
-      }
-      return {};
-    };
-
-    // Collect possible line-range fields
-    let startLine = parseNum(args.start_line ?? args.line_start);
-    let endLine = parseNum(args.end_line ?? args.line_end);
-    const lineCount = parseNum(args.count ?? args.line_count);
-    if (!startLine && typeof args.lines === 'string') {
-      const got = parseLinesSpec(args.lines);
-      startLine = got.start ?? startLine;
-      endLine = got.end ?? endLine;
-    }
-
-    if (startLine) {
-      // Line-range mode
-      // Prefer explicit file path if provided, regardless of prior chunked context.
-      const pathArg = args.path;
-      if (pathArg) {
-        const safePath = this.getSafePath(pathArg);
-        if (!safePath) return { status: 'error', data: 'Access denied.' };
-        try {
-          const stats = await fs.stat(safePath);
-          if (!stats.isFile()) return { status: 'error', data: 'Not a file.' };
-          const fullText = await fs.readFile(safePath, 'utf-8');
-          const allLines = fullText.split('\n');
-          const totalLines = allLines.length;
-          // If end_line is omitted, default to a small or requested window of lines
-          if (!endLine) {
-            const window = lineCount ?? DEFAULT_LINE_WINDOW;
-            endLine = Math.min((startLine as number) + window - 1, totalLines);
-          }
-          if (startLine < 1 || startLine > totalLines) {
-            return { status: 'error', data: `start_line out of range. Valid: 1..${totalLines}` };
-          }
-          if (endLine < startLine) {
-            return { status: 'error', data: 'end_line must be >= start_line.' };
-          }
-          if (endLine > totalLines) endLine = totalLines;
-          const slice = allLines.slice(startLine - 1, endLine).join('\n');
-          return { status: 'success', data: slice };
-        } catch (e) {
-          return { status: 'error', data: `Error reading file: ${e}` };
-        }
-      }
-
-      // Otherwise, if we have chunks (prior large output), slice from reconstructed full text.
-      if (hasChunks) {
-        const fullText = (chunks as string[]).join('');
-        const allLines = fullText.split('\n');
-        const totalLines = allLines.length;
-        // If end_line is omitted, default to a small or requested window of lines
-        if (!endLine) {
-          const window = lineCount ?? DEFAULT_LINE_WINDOW;
-          endLine = Math.min((startLine as number) + window - 1, totalLines);
-        }
-        if (startLine < 1 || startLine > totalLines) {
-          return { status: 'error', data: `start_line out of range. Valid: 1..${totalLines}` };
-        }
-        if (endLine < startLine) {
-          return { status: 'error', data: 'end_line must be >= start_line.' };
-        }
-        if (endLine > totalLines) endLine = totalLines;
-        const slice = allLines.slice(startLine - 1, endLine).join('\n');
-        return { status: 'success', data: slice };
-      }
-
-      // No chunks and no path fallback
-      return { status: 'error', data: "Missing context. Provide a valid 'tool_call_id' from a prior chunked result, or supply 'path' with 'start_line' and 'end_line' (or 'lines'='START..END')." };
-    }
-
-    // Chunk-index mode (backward compatible)
-    if (!hasChunks) {
-      return { status: 'error', data: "Missing context. Provide a valid 'tool_call_id' from a prior chunked result, or use line range with 'path'." };
-    }
-    const callId = toolCallId as string; // safe: hasChunks implies prior chunked result exists
-    let chunkNum: number;
-    if (args.chunk === undefined || args.chunk === null || args.chunk === '') {
-      const last = this.lastServedChunk.get(callId) ?? 0;
-      chunkNum = last + 1;
-    } else {
-      const n = Number(args.chunk);
-      chunkNum = Number.isNaN(n) ? 0 : n;
-    }
-    if (chunkNum < 0 || chunkNum >= (chunks as string[]).length) {
-      return { status: 'error', data: 'Invalid chunk number.' };
-    }
-    this.lastServedChunk.set(callId, chunkNum);
-    return { status: 'success', data: (chunks as string[])[chunkNum] };
-  }
+  // read_chunk removed in simplified API
 
   private async handleApplyPatch(args: any): Promise<ToolResult> {
     const patchText: string = args.patch || '';

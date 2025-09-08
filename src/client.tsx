@@ -363,13 +363,6 @@ const ChatInterface: React.FC<{
   // Removed thinking timer to reduce re-renders during streaming
   
   const localExecutor = useRef(new LocalToolExecutor());
-  // Track line counts of chunks per tool_call_id for fs.read/fs.read_chunk
-  const readChunkLineCountsRef = useRef<Map<string, Map<number, number>>>(new Map());
-  // Track last chunk index served per tool_call_id so we can infer the next chunk
-  const readChunkLastIdxRef = useRef<Map<string, number>>(new Map());
-  // Track origin of chunked outputs by the original tool_call_id
-  // Used to decide whether to add line numbers on subsequent read_chunk calls
-  const chunkOriginRef = useRef<Map<string, { toolName: string; action?: string }>>(new Map());
   const openaiClient = useRef(new OpenAI({
     baseURL: modelEndpoint,
     apiKey: 'dummy'
@@ -429,43 +422,7 @@ const ChatInterface: React.FC<{
     } catch {
       parsedArgs = null;
     }
-    // If the model called workspace.read_chunk without specifying a chunk, default to the next chunk
-    try {
-      if (toolName === 'workspace' && parsedArgs && typeof parsedArgs === 'object') {
-        const action = String(parsedArgs.action || '').toLowerCase();
-        if (action === 'read_chunk') {
-          const callId: string | undefined = parsedArgs.tool_call_id;
-          if (callId) {
-            const hasLineRange = (
-              parsedArgs.start_line !== undefined ||
-              parsedArgs.end_line !== undefined ||
-              parsedArgs.line_start !== undefined ||
-              parsedArgs.line_end !== undefined ||
-              typeof parsedArgs.lines === 'string'
-            );
-            if (!hasLineRange) {
-              if (parsedArgs.chunk === undefined || parsedArgs.chunk === null || parsedArgs.chunk === '') {
-                const last = readChunkLastIdxRef.current.get(callId);
-                // Default to 1 since chunk 0 preview is shown inline with the original tool output
-                const nextIdx = typeof last === 'number' ? last + 1 : 1;
-                parsedArgs.chunk = nextIdx;
-              } else {
-                // Normalize to number when possible
-                const asNum = Number(parsedArgs.chunk);
-                if (!Number.isNaN(asNum)) parsedArgs.chunk = asNum;
-              }
-              // Update last-served index for this callId
-              const asNum = Number(parsedArgs.chunk);
-              if (!Number.isNaN(asNum)) {
-                readChunkLastIdxRef.current.set(callId, asNum);
-              }
-            }
-            // Write back augmented args for execution and logging
-            try { toolCall.function.arguments = JSON.stringify(parsedArgs); } catch {}
-          }
-        }
-      }
-    } catch {}
+    // No read_chunk defaulting needed with simplified API
 
     try {
       const args = JSON.parse(toolCall.function.arguments);
@@ -547,133 +504,32 @@ const ChatInterface: React.FC<{
       }
     }
 
-    // Remember origin of chunked outputs so we know what read_chunk refers to later
-    const isLargeOutputNotice = typeof result.data === 'string' && resultText.startsWith('Output is too large');
-    if (isLargeOutputNotice) {
-      try {
-        const argsObj = JSON.parse(toolCall.function.arguments || '{}');
-        const action = (argsObj.action || '').toLowerCase();
-        // Map the original tool_call_id (this call) to its origin details
-        chunkOriginRef.current.set(toolCall.id, { toolName, action });
-      } catch {}
-    }
-
-    // Add line numbers when reading file content
+    // Add line numbers when reading file content (simplified: fs.read or workspace.read)
     let isReadTool = false;
-    let isReadChunk = false;
     try {
       const argsObj = JSON.parse(toolCall.function.arguments || '{}');
       const action = (argsObj.action || '').toLowerCase();
       if (toolName === 'workspace') {
-        isReadTool = action === 'read' || action === 'read_chunk';
-        isReadChunk = action === 'read_chunk';
-      } else if (toolName === 'fs.read' || toolName === 'fs.read_chunk') {
+        isReadTool = action === 'read';
+      } else if (toolName === 'fs.read') {
         isReadTool = true;
-        isReadChunk = toolName === 'fs.read_chunk';
       }
     } catch {}
-    // Only number read_chunk responses if the original chunked output came from a file read
-    let shouldNumber = isReadTool && !isLargeOutputNotice;
-    if (shouldNumber && isReadChunk) {
-      try {
-        const argsObj = JSON.parse(toolCall.function.arguments || '{}');
-        const callId: string | undefined = argsObj.tool_call_id;
-        if (callId) {
-          const origin = chunkOriginRef.current.get(callId);
-          const originIsRead = !!origin && (
-            (origin.toolName === 'workspace' && origin.action === 'read') ||
-            origin.toolName === 'fs.read'
-          );
-          if (!originIsRead) shouldNumber = false;
-        }
-      } catch {}
-    }
-    if (shouldNumber) {
-      // fs.read (small files) or fs.read_chunk (single chunk). For fs.read_chunk,
-      // keep numbering continuous by using stored counts for earlier chunks.
+
+    if (isReadTool) {
       const lines = resultText.split('\n');
       let startLine = 1;
-      if (isReadChunk) {
-        // Parse call args to find tool_call_id and either chunk index or start_line range
-        try {
-          const argsObj = JSON.parse(toolCall.function.arguments || '{}');
-          const callId: string | undefined = argsObj.tool_call_id;
-          const haveStart = Number.isFinite(Number(argsObj.start_line ?? argsObj.line_start)) || typeof argsObj.lines === 'string';
-          if (haveStart) {
-            // Line-range mode: begin numbering at the requested start_line
-            let s: number | undefined = Number(argsObj.start_line ?? argsObj.line_start);
-            if ((!s || !Number.isFinite(s)) && typeof argsObj.lines === 'string') {
-              const m = String(argsObj.lines).trim().match(/^(\d+)\s*(?:\.{2}|-|:)\s*(\d+)$/);
-              if (m) s = Number(m[1]);
-            }
-            if (s && Number.isFinite(s) && s > 0) startLine = Math.floor(s);
-          } else {
-            // Chunk-index mode
-            const chunkIdx: number = typeof argsObj.chunk === 'number' ? argsObj.chunk : 0;
-            if (callId) {
-              const countsMap = readChunkLineCountsRef.current.get(callId);
-              if (countsMap && chunkIdx > 0) {
-                // Sum known counts of prior chunks; only adjust if all are known
-                let sum = 0;
-                let allKnown = true;
-                for (let i = 0; i < chunkIdx; i++) {
-                  const c = countsMap.get(i);
-                  if (typeof c === 'number') sum += c; else { allKnown = false; break; }
-                }
-                if (allKnown) startLine = 1 + sum;
-              }
-              // Record current chunk's line count
-              let mapForCall = countsMap;
-              if (!mapForCall) {
-                mapForCall = new Map();
-                readChunkLineCountsRef.current.set(callId, mapForCall);
-              }
-              mapForCall.set(chunkIdx, lines.length);
-              // Track last served index to keep in sync with auto-inferred chunks
-              readChunkLastIdxRef.current.set(callId, chunkIdx);
-            }
-          }
-        } catch {}
-      }
+      try {
+        const argsObj = JSON.parse(toolCall.function.arguments || '{}');
+        const maybeStart = Number(argsObj.start_line);
+        if (Number.isFinite(maybeStart) && maybeStart > 0) {
+          startLine = Math.floor(maybeStart);
+        }
+      } catch {}
       const width = String(startLine + lines.length - 1).length;
       resultText = lines
         .map((line, idx) => `${String(startLine + idx).padStart(width, ' ')} | ${line}`)
         .join('\n');
-    } else if (isReadTool && isLargeOutputNotice) {
-      // For large outputs, we include the first chunk inline after a label.
-      // Add line numbers to that preview portion only, keeping the header untouched.
-      const firstChunkLabelIdx = resultText.indexOf('First chunk (');
-      if (firstChunkLabelIdx !== -1) {
-        const afterLabelNl = resultText.indexOf('\n', firstChunkLabelIdx);
-        if (afterLabelNl !== -1) {
-          const headerPart = resultText.slice(0, firstChunkLabelIdx);
-          const labelLine = resultText.slice(firstChunkLabelIdx, afterLabelNl); // without trailing \n
-          const preview = resultText.slice(afterLabelNl + 1);
-          const lines = preview.split('\n');
-          // Store count for chunk 0 under this tool_call_id so that subsequent
-          // read_chunk calls can continue line numbering.
-          try {
-            const argsObj = JSON.parse(toolCall.function.arguments || '{}');
-            const callId: string | undefined = toolCall.id; // initial read's own id
-            if (callId) {
-              let mapForCall = readChunkLineCountsRef.current.get(callId);
-              if (!mapForCall) {
-                mapForCall = new Map();
-                readChunkLineCountsRef.current.set(callId, mapForCall);
-              }
-              mapForCall.set(0, lines.length);
-              // Initialize last-served chunk to 0, since preview includes chunk 0
-              readChunkLastIdxRef.current.set(callId, 0);
-            }
-          } catch {}
-          const width = String(lines.length).length;
-          const numbered = lines
-            .map((line, idx) => `${String(idx + 1).padStart(width, ' ')} | ${line}`)
-            .join('\n');
-
-          resultText = `${headerPart}${labelLine}\n${numbered}`;
-        }
-      }
     }
 
     // Indent each line of the result for clearer hierarchy
