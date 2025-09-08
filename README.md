@@ -7,7 +7,7 @@
 ### Tools:
 - Web browsing
 - Exec (shell or Python)
-- Workspace (file system ops + patching)
+- Filesystem (fs.*: file ops + patching)
 
 ## Example test
 

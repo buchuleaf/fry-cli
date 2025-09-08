@@ -83,12 +83,11 @@ export class LocalToolExecutor {
     // does not need to call read_chunk for an initial preview.
     const preview = chunks[0] ?? '';
     const header = `Output is too large and has been split into ${chunks.length} chunks. Continue by:\n` +
-      `  - workspace(action='read_chunk', tool_call_id='${toolCallId}', chunk=<0..${chunks.length - 1}>)\n` +
-      `  - workspace(action='read_chunk', tool_call_id='${toolCallId}', start_line=<start>, end_line=<end>)\n` +
-      `  - workspace(action='read_chunk', tool_call_id='${toolCallId}', lines='START..END')\n` +
-      `  - or directly: workspace(action='read_chunk', path='<file>', start_line=<start>, end_line=<end>)\n` +
-      `  - or directly: workspace(action='read_chunk', path='<file>', lines='START..END')\n` +
-      `  - note: if tool_call_id is omitted, the latest chunked result is used.`;
+      `  - fs.read_chunk({ tool_call_id: '${toolCallId}', chunk: <0..${chunks.length - 1}> })\n` +
+      `  - fs.read_chunk({ tool_call_id: '${toolCallId}', start_line: <start>, end_line: <end> })\n` +
+      `  - fs.read_chunk({ tool_call_id: '${toolCallId}', lines: 'START..END' })\n` +
+      `  - or directly: fs.read_chunk({ path: '<file>', start_line: <start>, end_line: <end> })\n` +
+      `  - or directly: fs.read_chunk({ path: '<file>', lines: 'START..END' })`;
     const decoratedPreview = `\n\nFirst chunk (0/${chunks.length - 1}):\n${preview}`;
     return {
       status: 'success',
@@ -346,6 +345,8 @@ export class LocalToolExecutor {
         return await this.handleMkdir(args);
       case 'search_files':
         return await this.handleSearchFiles(args, toolCallId);
+      case 'apply_patch':
+        return await this.handleApplyPatch(args);
       case 'read_chunk':
         return await this.handleReadChunk(args);
       default:
