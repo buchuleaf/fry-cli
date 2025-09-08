@@ -28,6 +28,8 @@ export class LocalToolExecutor {
   private toolChunks: Map<string, string[]> = new Map();
   // Track the last-served chunk index per tool_call_id for read_chunk defaults
   private lastServedChunk: Map<string, number> = new Map();
+  // Remember the most recent tool_call_id that produced chunked output (for implicit read_chunk)
+  private lastChunkedToolCallId: string | null = null;
 
   constructor() {}
 
@@ -72,6 +74,8 @@ export class LocalToolExecutor {
     this.toolChunks.set(toolCallId, chunks);
     // Since we include the first chunk inline in the preview, initialize last-served to 0
     this.lastServedChunk.set(toolCallId, 0);
+    // Track this as the latest chunked output for implicit follow-ups
+    this.lastChunkedToolCallId = toolCallId;
 
     // Return the standard notice plus the first chunk inline so the model
     // does not need to call read_chunk for an initial preview.
@@ -80,7 +84,8 @@ export class LocalToolExecutor {
       `  - workspace(action='read_chunk', tool_call_id='${toolCallId}', chunk=<0..${chunks.length - 1}>)\n` +
       `  - workspace(action='read_chunk', tool_call_id='${toolCallId}', start_line=<start>, end_line=<end>)\n` +
       `  - workspace(action='read_chunk', tool_call_id='${toolCallId}', lines='START..END')\n` +
-      `  - or directly: workspace(action='read_chunk', path='<file>', start_line=<start>, end_line=<end>)`;
+      `  - or directly: workspace(action='read_chunk', path='<file>', start_line=<start>, end_line=<end>)\n` +
+      `  - note: if tool_call_id is omitted, the latest chunked result is used.`;
     const decoratedPreview = `\n\nFirst chunk (0/${chunks.length - 1}):\n${preview}`;
     return {
       status: 'success',
@@ -541,7 +546,8 @@ export class LocalToolExecutor {
   }
 
   private async handleReadChunk(args: any): Promise<ToolResult> {
-    const toolCallId = args.tool_call_id;
+    const idLike = args.tool_call_id ?? args.call_id ?? args.chunk_id ?? this.lastChunkedToolCallId ?? undefined;
+    const toolCallId: string | undefined = typeof idLike === 'string' && idLike.trim().length > 0 ? idLike : undefined;
     let chunks = toolCallId ? this.toolChunks.get(toolCallId) : undefined;
     const hasChunks = Array.isArray(chunks) && chunks.length > 0;
 
@@ -626,9 +632,10 @@ export class LocalToolExecutor {
     if (!hasChunks) {
       return { status: 'error', data: "Missing context. Provide a valid 'tool_call_id' from a prior chunked result, or use line range with 'path'." };
     }
+    const callId = toolCallId as string; // safe: hasChunks implies prior chunked result exists
     let chunkNum: number;
     if (args.chunk === undefined || args.chunk === null || args.chunk === '') {
-      const last = this.lastServedChunk.get(toolCallId) ?? 0;
+      const last = this.lastServedChunk.get(callId) ?? 0;
       chunkNum = last + 1;
     } else {
       const n = Number(args.chunk);
@@ -637,7 +644,7 @@ export class LocalToolExecutor {
     if (chunkNum < 0 || chunkNum >= (chunks as string[]).length) {
       return { status: 'error', data: 'Invalid chunk number.' };
     }
-    this.lastServedChunk.set(toolCallId, chunkNum);
+    this.lastServedChunk.set(callId, chunkNum);
     return { status: 'success', data: (chunks as string[])[chunkNum] };
   }
 
