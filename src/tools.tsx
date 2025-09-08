@@ -335,7 +335,7 @@ export class LocalToolExecutor {
         }
       }
 
-      return this.chunkContent(formattedItems.join('\n'), toolCallId, { lineSafe: true });
+      return { status: 'success', data: formattedItems.join('\n') };
     } catch (error) {
       return { status: 'error', data: `Error listing directory: ${error}` };
     }
@@ -518,7 +518,7 @@ export class LocalToolExecutor {
         return { status: 'success', data: `No matches found for '${pattern}'.` };
       }
 
-      return this.chunkContent(matches.join('\n'), toolCallId, { lineSafe: true });
+      return { status: 'success', data: matches.join('\n') };
     } catch (error) {
       return { status: 'error', data: `Error during file search: ${error}` };
     }
