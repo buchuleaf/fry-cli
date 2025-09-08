@@ -157,49 +157,105 @@ export class LocalToolExecutor {
     const command = args.command || '';
     if (!command) return { status: 'error', data: 'No command provided.' };
 
-    const tryRunner = (prog: string, progArgs: string[]): Promise<ToolResult> => {
-      return new Promise((resolve) => {
-        const proc = spawn(prog, progArgs, {
-          cwd: this.workspaceDir,
-          timeout: 20000,
-        });
-
+    // Helper to run a shell and capture outputs with exit code for better decision making
+    const runShell = (prog: string, progArgs: string[]) => {
+      return new Promise<{ code: number | null, stdout: string, stderr: string, notFound: boolean, errorMsg?: string }>((resolve) => {
+        const proc = spawn(prog, progArgs, { cwd: this.workspaceDir, timeout: 20000 });
         let stdout = '';
         let stderr = '';
-
-        proc.stdout.on('data', (data) => { stdout += data.toString(); });
-        proc.stderr.on('data', (data) => { stderr += data.toString(); });
-
-        proc.on('close', (code) => {
-          const output = `EXIT: ${code}\nSTDOUT:\n${stdout}\nSTDERR:\n${stderr}`;
-          resolve(this.chunkContent(output, toolCallId, { lineSafe: true }));
-        });
-
+        proc.stdout.on('data', (d) => { stdout += d.toString(); });
+        proc.stderr.on('data', (d) => { stderr += d.toString(); });
+        proc.on('close', (code) => resolve({ code, stdout, stderr, notFound: false }));
         proc.on('error', (error: any) => {
-          if (error.code === 'ENOENT' || String(error.message).includes('ENOENT')) {
-            resolve({ status: 'error', data: `Command not found: ${prog}. Please ensure a shell is installed and in your PATH.` });
+          const msg = String(error?.message || '');
+          if (error?.code === 'ENOENT' || msg.includes('ENOENT')) {
+            resolve({ code: null, stdout: '', stderr: '', notFound: true, errorMsg: msg });
           } else {
-            resolve({ status: 'error', data: `Shell execution failed: ${error.message}` });
+            resolve({ code: null, stdout: '', stderr: msg || 'Unknown error', notFound: false, errorMsg: msg });
           }
         });
       });
     };
 
-    // Prefer POSIX shells; fall back to Windows cmd.exe, then PowerShell
+    const toResult = (code: number | null, stdout: string, stderr: string): ToolResult => {
+      const output = `EXIT: ${code}\nSTDOUT:\n${stdout}\nSTDERR:\n${stderr}`;
+      return this.chunkContent(output, toolCallId, { lineSafe: true });
+    };
+
+    // Non-Windows: prefer bash, then sh
     if (process.platform !== 'win32') {
-      let result = await tryRunner('bash', ['-lc', command]);
-      if (result.status === 'error' && String(result.data).startsWith('Command not found')) {
-        result = await tryRunner('sh', ['-lc', command]);
+      let r = await runShell('bash', ['-lc', command]);
+      if (r.notFound) {
+        r = await runShell('sh', ['-lc', command]);
       }
-      return result;
-    } else {
-      // Windows
-      let result = await tryRunner('cmd.exe', ['/d', '/s', '/c', command]);
-      if (result.status === 'error') {
-        result = await tryRunner('powershell', ['-NoProfile', '-NonInteractive', '-Command', command]);
+      if (r.notFound) {
+        return { status: 'error', data: 'Command not found: bash/sh. Please ensure a POSIX shell is installed and in your PATH.' };
       }
-      return result;
+      return toResult(r.code, r.stdout, r.stderr);
     }
+
+    // Windows: prefer a shell based on command shape, normalize for cmd, and smart fallback.
+    const looksPosixy = (() => {
+      const c = command.trim();
+      if (c.startsWith('./')) return true;
+      // Common POSIX tools the model might use
+      if (/(?:^|\s)(ls|pwd|cat|grep|rm|mv|cp|touch)\b/.test(c)) return true;
+      // Use of forward slashes with relative paths
+      if (/\.\//.test(c)) return true;
+      return false;
+    })();
+
+    const runInPowershell = async (cmd: string) => {
+      return runShell('powershell', ['-NoProfile', '-NonInteractive', '-Command', cmd]);
+    };
+    const runInCmd = async (cmd: string) => {
+      // For cmd.exe, normalize leading './' to '.\' so relative executables run
+      let normalized = cmd;
+      if (normalized.trim().startsWith('./')) {
+        normalized = normalized.replace(/^\s*\.\//, '.\\');
+      }
+      return runShell('cmd.exe', ['/d', '/s', '/c', normalized]);
+    };
+
+    const shouldFallbackToCmd = (stderr: string) => {
+      // PowerShell parse errors for cmd-style tokens
+      return /Unexpected token '&&'|The term '.+?' is not recognized as the name of a cmdlet/i.test(stderr);
+    };
+    const shouldFallbackToPowershell = (stderr: string) => {
+      // cmd.exe not recognizing POSIXy usage like './prog' or unknown commands like 'ls'
+      return /is not recognized as an internal or external command|^'\.' is not recognized/i.test(stderr);
+    };
+
+    // Choose initial shell
+    let first: 'ps' | 'cmd' = looksPosixy ? 'ps' : 'cmd';
+    // But if command obviously chains with '&&' or '||', prefer cmd first (PS 5 doesn't support '&&')
+    if (/[&]{2}|\|{2}/.test(command)) first = 'cmd';
+
+    let firstRun = first === 'ps' ? await runInPowershell(command) : await runInCmd(command);
+    // If the chosen shell is missing, try the other
+    if (firstRun.notFound) {
+      const secondRun = first === 'ps' ? await runInCmd(command) : await runInPowershell(command);
+      if (secondRun.notFound) {
+        return { status: 'error', data: 'No suitable shell found (PowerShell/cmd.exe) in PATH.' };
+      }
+      return toResult(secondRun.code, secondRun.stdout, secondRun.stderr);
+    }
+
+    // If success (exit code 0), return immediately
+    if (firstRun.code === 0) {
+      return toResult(firstRun.code, firstRun.stdout, firstRun.stderr);
+    }
+
+    // Non-zero exit code: decide whether to fallback based on error signature
+    const stderr = firstRun.stderr || '';
+    const fallback = first === 'ps' ? shouldFallbackToCmd(stderr) : shouldFallbackToPowershell(stderr);
+    if (!fallback) {
+      // Return the first result as-is
+      return toResult(firstRun.code, firstRun.stdout, firstRun.stderr);
+    }
+
+    const secondRun = first === 'ps' ? await runInCmd(command) : await runInPowershell(command);
+    return toResult(secondRun.code, secondRun.stdout, secondRun.stderr);
   }
 
   private async handlePythonTool(args: any, toolCallId: string): Promise<ToolResult> {
