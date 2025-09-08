@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // client.tsx
 import React, { useState, useEffect, useRef } from 'react';
-import { render, Text, Box, useInput, useApp, Static, useStdin } from 'ink';
+import { render, Text, Box, useInput, useApp, Static, useStdin, useFocus } from 'ink';
 // Removed animated spinner to avoid frequent re-renders that can disrupt scroll
 import TextInput from 'ink-text-input';
 import Gradient from 'ink-gradient';
@@ -1055,7 +1055,7 @@ const ChatInterface: React.FC<{
       exit();
     }
     
-    if (key.ctrl && char.toLowerCase() === 'c') {
+    if (key.ctrl && (char || '').toLowerCase() === 'c') {
       if (isProcessing) {
         // If processing, set the interruption flag and also exit immediately
         // to ensure the user can always interrupt, even with long responses
@@ -1084,10 +1084,11 @@ const ChatInterface: React.FC<{
       )}
 
       {!isProcessing && (
-        <Box>
-          <Text color="blue" bold>👤 You: </Text>
-          <TextInput focus value={input} onChange={setInput} onSubmit={handleSubmit} />
-        </Box>
+        <ChatPrompt
+          value={input}
+          onChange={setInput}
+          onSubmit={handleSubmit}
+        />
       )}
   
       <Box marginTop={1} justifyContent="space-between">
@@ -1112,6 +1113,17 @@ const ChatInterface: React.FC<{
   );
 };
 
+// Separated to attach its own focus handling cleanly
+const ChatPrompt: React.FC<{ value: string; onChange: (v: string) => void; onSubmit: (v: string) => void }> = ({ value, onChange, onSubmit }) => {
+  const { isFocused } = useFocus({ autoFocus: true, isActive: true });
+  return (
+    <Box>
+      <Text color="blue" bold>👤 You: </Text>
+      <TextInput focus={isFocused} value={value} onChange={onChange} onSubmit={onSubmit} />
+    </Box>
+  );
+};
+
 // Endpoint Selection Component
 const EndpointSelector: React.FC<{ onSelect: (url: string) => void }> = ({ onSelect }) => {
   const presets = [
@@ -1124,6 +1136,7 @@ const EndpointSelector: React.FC<{ onSelect: (url: string) => void }> = ({ onSel
 
   const [showCustomInput, setShowCustomInput] = useState(false);
   const [customUrl, setCustomUrl] = useState('');
+  const { isFocused: urlInputFocused } = useFocus({ autoFocus: true, isActive: showCustomInput });
 
   const handleSelect = (item: any) => {
     if (item.value === 'custom') {
@@ -1141,7 +1154,7 @@ const EndpointSelector: React.FC<{ onSelect: (url: string) => void }> = ({ onSel
     return (
       <Box flexDirection="column">
         <Text color="cyan" bold>Enter custom endpoint URL:</Text>
-        <TextInput focus value={customUrl} onChange={setCustomUrl} onSubmit={handleCustomSubmit} />
+        <TextInput focus={urlInputFocused} value={customUrl} onChange={setCustomUrl} onSubmit={handleCustomSubmit} />
       </Box>
     );
   }
@@ -1182,6 +1195,7 @@ const ApiKeyInput: React.FC<{ backendUrl: string; onAuthenticated: (sessionRespo
   const [apiKey, setApiKey] = useState('');
   const [isAuthenticating, setIsAuthenticating] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const { isFocused: apiKeyFocused } = useFocus({ autoFocus: true, isActive: true });
 
   useEffect(() => {
     const findAndAuthKey = async () => {
@@ -1227,7 +1241,7 @@ const ApiKeyInput: React.FC<{ backendUrl: string; onAuthenticated: (sessionRespo
       {error && <Text color="red">{error}</Text>}
       <Box marginTop={1}>
         <Text>Enter API key: </Text>
-        <TextInput focus value={apiKey} onChange={setApiKey} onSubmit={handleSubmit} />
+        <TextInput focus={apiKeyFocused} value={apiKey} onChange={setApiKey} onSubmit={handleSubmit} />
       </Box>
     </Box>
   );
