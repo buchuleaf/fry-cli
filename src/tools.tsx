@@ -76,10 +76,11 @@ export class LocalToolExecutor {
     // Return the standard notice plus the first chunk inline so the model
     // does not need to call read_chunk for an initial preview.
     const preview = chunks[0] ?? '';
-    const header = `Output is too large and has been split into ${chunks.length} chunks. Use one of:\n` +
+    const header = `Output is too large and has been split into ${chunks.length} chunks. Continue by:\n` +
       `  - workspace(action='read_chunk', tool_call_id='${toolCallId}', chunk=<0..${chunks.length - 1}>)\n` +
       `  - workspace(action='read_chunk', tool_call_id='${toolCallId}', start_line=<start>, end_line=<end>)\n` +
-      `  - workspace(action='read_chunk', tool_call_id='${toolCallId}', lines='START..END')`;
+      `  - workspace(action='read_chunk', tool_call_id='${toolCallId}', lines='START..END')\n` +
+      `  - or directly: workspace(action='read_chunk', path='<file>', start_line=<start>, end_line=<end>)`;
     const decoratedPreview = `\n\nFirst chunk (0/${chunks.length - 1}):\n${preview}`;
     return {
       status: 'success',
@@ -154,7 +155,8 @@ export class LocalToolExecutor {
           chunk: args.chunk,
           start_line: args.start_line ?? args.line_start,
           end_line: args.end_line ?? args.line_end,
-          lines: args.lines
+          lines: args.lines,
+          path: args.path
         });
       default:
         return { status: 'error', data: "Unknown or missing 'action'. Use one of: ls, read, write, mkdir, search_files, apply_patch, read_chunk." };
@@ -540,14 +542,8 @@ export class LocalToolExecutor {
 
   private async handleReadChunk(args: any): Promise<ToolResult> {
     const toolCallId = args.tool_call_id;
-    if (!toolCallId) {
-      return { status: 'error', data: 'Missing tool_call_id.' };
-    }
-
-    const chunks = this.toolChunks.get(toolCallId);
-    if (!chunks) {
-      return { status: 'error', data: 'Invalid tool_call_id.' };
-    }
+    let chunks = toolCallId ? this.toolChunks.get(toolCallId) : undefined;
+    const hasChunks = Array.isArray(chunks) && chunks.length > 0;
 
     // Optional line-range mode
     const parseNum = (v: any): number | undefined => {
@@ -575,25 +571,61 @@ export class LocalToolExecutor {
 
     if (startLine) {
       // Line-range mode
-      // Reconstruct full text to slice by lines regardless of chunk boundaries
-      const fullText = chunks.join('');
-      const allLines = fullText.split('\n');
-      const totalLines = allLines.length;
-      if (!endLine) {
-        return { status: 'error', data: "Missing 'end_line'. Provide both start_line and end_line." };
+      // If we have chunks (prior large output), slice from reconstructed full text.
+      if (hasChunks) {
+        const fullText = (chunks as string[]).join('');
+        const allLines = fullText.split('\n');
+        const totalLines = allLines.length;
+        if (!endLine) {
+          return { status: 'error', data: "Missing 'end_line'. Provide both start_line and end_line." };
+        }
+        if (startLine < 1 || startLine > totalLines) {
+          return { status: 'error', data: `start_line out of range. Valid: 1..${totalLines}` };
+        }
+        if (endLine < startLine) {
+          return { status: 'error', data: 'end_line must be >= start_line.' };
+        }
+        if (endLine > totalLines) endLine = totalLines;
+        const slice = allLines.slice(startLine - 1, endLine).join('\n');
+        return { status: 'success', data: slice };
       }
-      if (startLine < 1 || startLine > totalLines) {
-        return { status: 'error', data: `start_line out of range. Valid: 1..${totalLines}` };
+
+      // Fallback: no tool_call_id context. If a 'path' is provided, read the file directly.
+      const pathArg = args.path;
+      if (pathArg) {
+        const safePath = this.getSafePath(pathArg);
+        if (!safePath) return { status: 'error', data: 'Access denied.' };
+        try {
+          const stats = await fs.stat(safePath);
+          if (!stats.isFile()) return { status: 'error', data: 'Not a file.' };
+          const fullText = await fs.readFile(safePath, 'utf-8');
+          const allLines = fullText.split('\n');
+          const totalLines = allLines.length;
+          if (!endLine) {
+            return { status: 'error', data: "Missing 'end_line'. Provide both start_line and end_line." };
+          }
+          if (startLine < 1 || startLine > totalLines) {
+            return { status: 'error', data: `start_line out of range. Valid: 1..${totalLines}` };
+          }
+          if (endLine < startLine) {
+            return { status: 'error', data: 'end_line must be >= start_line.' };
+          }
+          if (endLine > totalLines) endLine = totalLines;
+          const slice = allLines.slice(startLine - 1, endLine).join('\n');
+          return { status: 'success', data: slice };
+        } catch (e) {
+          return { status: 'error', data: `Error reading file: ${e}` };
+        }
       }
-      if (endLine < startLine) {
-        return { status: 'error', data: 'end_line must be >= start_line.' };
-      }
-      if (endLine > totalLines) endLine = totalLines;
-      const slice = allLines.slice(startLine - 1, endLine).join('\n');
-      return { status: 'success', data: slice };
+
+      // No chunks and no path fallback
+      return { status: 'error', data: "Missing context. Provide a valid 'tool_call_id' from a prior chunked result, or supply 'path' with 'start_line' and 'end_line' (or 'lines'='START..END')." };
     }
 
     // Chunk-index mode (backward compatible)
+    if (!hasChunks) {
+      return { status: 'error', data: "Missing context. Provide a valid 'tool_call_id' from a prior chunked result, or use line range with 'path'." };
+    }
     let chunkNum: number;
     if (args.chunk === undefined || args.chunk === null || args.chunk === '') {
       const last = this.lastServedChunk.get(toolCallId) ?? 0;
@@ -602,11 +634,11 @@ export class LocalToolExecutor {
       const n = Number(args.chunk);
       chunkNum = Number.isNaN(n) ? 0 : n;
     }
-    if (chunkNum < 0 || chunkNum >= chunks.length) {
+    if (chunkNum < 0 || chunkNum >= (chunks as string[]).length) {
       return { status: 'error', data: 'Invalid chunk number.' };
     }
     this.lastServedChunk.set(toolCallId, chunkNum);
-    return { status: 'success', data: chunks[chunkNum] };
+    return { status: 'success', data: (chunks as string[])[chunkNum] };
   }
 
   private async handleApplyPatch(args: any): Promise<ToolResult> {
