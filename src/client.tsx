@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // client.tsx
 import React, { useState, useEffect, useRef } from 'react';
-import { render, Text, Box, useInput, useApp, Static } from 'ink';
+import { render, Text, Box, useInput, useApp, Static, useStdin } from 'ink';
 // Removed animated spinner to avoid frequent re-renders that can disrupt scroll
 import TextInput from 'ink-text-input';
 import Gradient from 'ink-gradient';
@@ -352,6 +352,7 @@ const ChatInterface: React.FC<{
   streamIntervalMs: number;
 }> = ({ client, sessionData, modelEndpoint, modelName, initialRateLimitStatus, onResetSession, showAnalysis, streamChunks, streamIntervalMs }) => {
   const { exit } = useApp();
+  const { isRawModeSupported, setRawMode } = useStdin();
   const [input, setInput] = useState('');
   // Append-only transcript using Ink's <Static> for scroll stability
   const [staticItems, setStaticItems] = useState<TranscriptItem[]>([]);
@@ -397,6 +398,18 @@ const ChatInterface: React.FC<{
     );
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Ensure raw mode is enabled on Windows so input keystrokes are captured reliably
+  useEffect(() => {
+    try {
+      if (process.platform === 'win32' && isRawModeSupported) {
+        setRawMode(true);
+        return () => {
+          try { setRawMode(false); } catch {}
+        };
+      }
+    } catch {}
+  }, [isRawModeSupported, setRawMode]);
 
   // Streaming state: we only buffer in a ref to avoid re-renders
   const liveAssistantContentRef = useRef<string>('');
@@ -1036,12 +1049,13 @@ const ChatInterface: React.FC<{
     await processChatTurn(userInput);
   };
 
-  useInput((input, key) => {
+  // Global key handler for ESC and Ctrl+C. Avoid name shadowing with input state.
+  useInput((char, key) => {
     if (key.escape) {
       exit();
     }
     
-    if (key.ctrl && input.toLowerCase() === 'c') {
+    if (key.ctrl && char.toLowerCase() === 'c') {
       if (isProcessing) {
         // If processing, set the interruption flag and also exit immediately
         // to ensure the user can always interrupt, even with long responses
@@ -1072,7 +1086,7 @@ const ChatInterface: React.FC<{
       {!isProcessing && (
         <Box>
           <Text color="blue" bold>👤 You: </Text>
-          <TextInput value={input} onChange={setInput} onSubmit={handleSubmit} />
+          <TextInput focus value={input} onChange={setInput} onSubmit={handleSubmit} />
         </Box>
       )}
   
@@ -1127,7 +1141,7 @@ const EndpointSelector: React.FC<{ onSelect: (url: string) => void }> = ({ onSel
     return (
       <Box flexDirection="column">
         <Text color="cyan" bold>Enter custom endpoint URL:</Text>
-        <TextInput value={customUrl} onChange={setCustomUrl} onSubmit={handleCustomSubmit} />
+        <TextInput focus value={customUrl} onChange={setCustomUrl} onSubmit={handleCustomSubmit} />
       </Box>
     );
   }
@@ -1213,7 +1227,7 @@ const ApiKeyInput: React.FC<{ backendUrl: string; onAuthenticated: (sessionRespo
       {error && <Text color="red">{error}</Text>}
       <Box marginTop={1}>
         <Text>Enter API key: </Text>
-        <TextInput value={apiKey} onChange={setApiKey} onSubmit={handleSubmit} />
+        <TextInput focus value={apiKey} onChange={setApiKey} onSubmit={handleSubmit} />
       </Box>
     </Box>
   );
