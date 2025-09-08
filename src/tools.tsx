@@ -582,28 +582,7 @@ export class LocalToolExecutor {
 
     if (startLine) {
       // Line-range mode
-      // If we have chunks (prior large output), slice from reconstructed full text.
-      if (hasChunks) {
-        const fullText = (chunks as string[]).join('');
-        const allLines = fullText.split('\n');
-        const totalLines = allLines.length;
-        // If end_line is omitted, default to a small or requested window of lines
-        if (!endLine) {
-          const window = lineCount ?? DEFAULT_LINE_WINDOW;
-          endLine = Math.min((startLine as number) + window - 1, totalLines);
-        }
-        if (startLine < 1 || startLine > totalLines) {
-          return { status: 'error', data: `start_line out of range. Valid: 1..${totalLines}` };
-        }
-        if (endLine < startLine) {
-          return { status: 'error', data: 'end_line must be >= start_line.' };
-        }
-        if (endLine > totalLines) endLine = totalLines;
-        const slice = allLines.slice(startLine - 1, endLine).join('\n');
-        return { status: 'success', data: slice };
-      }
-
-      // Fallback: no tool_call_id context. If a 'path' is provided, read the file directly.
+      // Prefer explicit file path if provided, regardless of prior chunked context.
       const pathArg = args.path;
       if (pathArg) {
         const safePath = this.getSafePath(pathArg);
@@ -631,6 +610,27 @@ export class LocalToolExecutor {
         } catch (e) {
           return { status: 'error', data: `Error reading file: ${e}` };
         }
+      }
+
+      // Otherwise, if we have chunks (prior large output), slice from reconstructed full text.
+      if (hasChunks) {
+        const fullText = (chunks as string[]).join('');
+        const allLines = fullText.split('\n');
+        const totalLines = allLines.length;
+        // If end_line is omitted, default to a small or requested window of lines
+        if (!endLine) {
+          const window = lineCount ?? DEFAULT_LINE_WINDOW;
+          endLine = Math.min((startLine as number) + window - 1, totalLines);
+        }
+        if (startLine < 1 || startLine > totalLines) {
+          return { status: 'error', data: `start_line out of range. Valid: 1..${totalLines}` };
+        }
+        if (endLine < startLine) {
+          return { status: 'error', data: 'end_line must be >= start_line.' };
+        }
+        if (endLine > totalLines) endLine = totalLines;
+        const slice = allLines.slice(startLine - 1, endLine).join('\n');
+        return { status: 'success', data: slice };
       }
 
       // No chunks and no path fallback
