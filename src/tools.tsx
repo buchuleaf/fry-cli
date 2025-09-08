@@ -78,7 +78,8 @@ export class LocalToolExecutor {
     const preview = chunks[0] ?? '';
     const header = `Output is too large and has been split into ${chunks.length} chunks. Use one of:\n` +
       `  - workspace(action='read_chunk', tool_call_id='${toolCallId}', chunk=<0..${chunks.length - 1}>)\n` +
-      `  - workspace(action='read_chunk', tool_call_id='${toolCallId}', start_line=<start>, end_line=<end>)`;
+      `  - workspace(action='read_chunk', tool_call_id='${toolCallId}', start_line=<start>, end_line=<end>)\n` +
+      `  - workspace(action='read_chunk', tool_call_id='${toolCallId}', lines='START..END')`;
     const decoratedPreview = `\n\nFirst chunk (0/${chunks.length - 1}):\n${preview}`;
     return {
       status: 'success',
@@ -147,7 +148,14 @@ export class LocalToolExecutor {
       case 'apply_patch':
         return this.handleApplyPatch({ patch: args.patch });
       case 'read_chunk':
-        return this.handleReadChunk({ tool_call_id: args.tool_call_id, chunk: args.chunk });
+        // Forward all supported addressing modes: chunk index OR explicit line ranges
+        return this.handleReadChunk({
+          tool_call_id: args.tool_call_id,
+          chunk: args.chunk,
+          start_line: args.start_line ?? args.line_start,
+          end_line: args.end_line ?? args.line_end,
+          lines: args.lines
+        });
       default:
         return { status: 'error', data: "Unknown or missing 'action'. Use one of: ls, read, write, mkdir, search_files, apply_patch, read_chunk." };
     }

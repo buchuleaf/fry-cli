@@ -436,20 +436,29 @@ const ChatInterface: React.FC<{
         if (action === 'read_chunk') {
           const callId: string | undefined = parsedArgs.tool_call_id;
           if (callId) {
-            if (parsedArgs.chunk === undefined || parsedArgs.chunk === null || parsedArgs.chunk === '') {
-              const last = readChunkLastIdxRef.current.get(callId);
-              // Default to 1 since chunk 0 preview is shown inline with the original tool output
-              const nextIdx = typeof last === 'number' ? last + 1 : 1;
-              parsedArgs.chunk = nextIdx;
-            } else {
-              // Normalize to number when possible
+            const hasLineRange = (
+              parsedArgs.start_line !== undefined ||
+              parsedArgs.end_line !== undefined ||
+              parsedArgs.line_start !== undefined ||
+              parsedArgs.line_end !== undefined ||
+              typeof parsedArgs.lines === 'string'
+            );
+            if (!hasLineRange) {
+              if (parsedArgs.chunk === undefined || parsedArgs.chunk === null || parsedArgs.chunk === '') {
+                const last = readChunkLastIdxRef.current.get(callId);
+                // Default to 1 since chunk 0 preview is shown inline with the original tool output
+                const nextIdx = typeof last === 'number' ? last + 1 : 1;
+                parsedArgs.chunk = nextIdx;
+              } else {
+                // Normalize to number when possible
+                const asNum = Number(parsedArgs.chunk);
+                if (!Number.isNaN(asNum)) parsedArgs.chunk = asNum;
+              }
+              // Update last-served index for this callId
               const asNum = Number(parsedArgs.chunk);
-              if (!Number.isNaN(asNum)) parsedArgs.chunk = asNum;
-            }
-            // Update last-served index for this callId
-            const asNum = Number(parsedArgs.chunk);
-            if (!Number.isNaN(asNum)) {
-              readChunkLastIdxRef.current.set(callId, asNum);
+              if (!Number.isNaN(asNum)) {
+                readChunkLastIdxRef.current.set(callId, asNum);
+              }
             }
             // Write back augmented args for execution and logging
             try { toolCall.function.arguments = JSON.stringify(parsedArgs); } catch {}
