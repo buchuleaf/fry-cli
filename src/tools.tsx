@@ -395,7 +395,17 @@ export class LocalToolExecutor {
       if (endLine > totalLines) endLine = totalLines;
 
       const slice = allLines.slice(startLine - 1, endLine).join('\n');
-      return { status: 'success', data: slice };
+      const hasMore = endLine < totalLines;
+      const payload = {
+        path: pathArg,
+        content: slice,
+        start_line: startLine,
+        end_line: endLine,
+        total_lines: totalLines,
+        has_more: hasMore,
+        next_start_line: hasMore ? endLine + 1 : undefined,
+      };
+      return { status: 'success', data: payload };
     } catch (error) {
       return { status: 'error', data: `Error reading file: ${error}` };
     }

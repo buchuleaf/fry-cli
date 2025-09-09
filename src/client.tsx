@@ -526,26 +526,48 @@ const ChatInterface: React.FC<{
     } catch {}
 
     if (isReadTool) {
-      const lines = resultText.split('\n');
-      let startLine = 1;
-      try {
-        const argsObj = JSON.parse(toolCall.function.arguments || '{}');
-        const parseNum = (v: any) => {
-          const n = Number(v);
-          return Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
-        };
-        // Prefer explicit start_line, then line_start, then lines="A..B"
-        let s = parseNum(argsObj.start_line) ?? parseNum(argsObj.line_start);
-        if (!s && typeof argsObj.lines === 'string') {
-          const m = String(argsObj.lines).trim().match(/^(\d+)\s*(?:\.{2}|-|:)\s*(\d+)$/);
-          if (m) s = parseNum(m[1]);
+      // Prefer structured fs.read payloads: { content, start_line, end_line, total_lines, has_more, next_start_line }
+      let contentForNumbering: string;
+      let startLineForNumbering = 1;
+      let footerSuffix = '';
+
+      if (resultRaw && typeof resultRaw === 'object' && typeof resultRaw.content === 'string') {
+        contentForNumbering = resultRaw.content;
+        if (Number.isFinite(Number(resultRaw.start_line))) {
+          startLineForNumbering = Math.max(1, Math.floor(Number(resultRaw.start_line)));
         }
-        if (s) startLine = s;
-      } catch {}
-      const width = String(startLine + lines.length - 1).length;
-      resultText = lines
-        .map((line, idx) => `${String(startLine + idx).padStart(width, ' ')} | ${line}`)
+        const endLine = Number(resultRaw.end_line);
+        const totalLines = Number(resultRaw.total_lines);
+        const hasMore = Boolean(resultRaw.has_more);
+        const nextStart = Number(resultRaw.next_start_line);
+        if (Number.isFinite(endLine) && Number.isFinite(totalLines)) {
+          footerSuffix = `\n\n[fs.read] Showing ${startLineForNumbering}..${endLine} of ${totalLines} lines.` + (hasMore && Number.isFinite(nextStart) ? ` More available; use start_line=${nextStart}.` : '');
+        }
+      } else {
+        // Back-compat: older fs.read returns content as plain string
+        contentForNumbering = resultText;
+        try {
+          const argsObj = JSON.parse(toolCall.function.arguments || '{}');
+          const parseNum = (v: any) => {
+            const n = Number(v);
+            return Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
+          };
+          // Prefer explicit start_line, then line_start, then lines="A..B"
+          let s = parseNum(argsObj.start_line) ?? parseNum(argsObj.line_start);
+          if (!s && typeof argsObj.lines === 'string') {
+            const m = String(argsObj.lines).trim().match(/^(\d+)\s*(?:\.{2}|-|:)\s*(\d+)$/);
+            if (m) s = parseNum(m[1]);
+          }
+          if (s) startLineForNumbering = s;
+        } catch {}
+      }
+
+      const lines = contentForNumbering.split('\n');
+      const width = String(startLineForNumbering + lines.length - 1).length;
+      const numbered = lines
+        .map((line, idx) => `${String(startLineForNumbering + idx).padStart(width, ' ')} | ${line}`)
         .join('\n');
+      resultText = numbered + footerSuffix;
     }
 
     // Indent each line of the result for clearer hierarchy
