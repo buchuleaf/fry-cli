@@ -424,6 +424,8 @@ const ChatInterface: React.FC<{
   // Streaming state: we only buffer in a ref to avoid re-renders
   const liveAssistantContentRef = useRef<string>('');
   const assistantHeaderAppendedRef = useRef<boolean>(false);
+  // Tracks when the header has been committed to the static transcript
+  const headerCommittedRef = useRef<boolean>(false);
   // Harmony-specific: no special code-block reasoning handling needed beyond markdown rendering
   // Live preview shown during streaming (single dynamic block to avoid scroll yank)
   const [livePreview, setLivePreview] = useState<string>('');
@@ -650,6 +652,7 @@ const ChatInterface: React.FC<{
         // Initialize per-token streaming state. We avoid UI re-renders during streaming
         // and only append at a throttle interval (if enabled) or once at the end.
         assistantHeaderAppendedRef.current = false;
+        headerCommittedRef.current = false;
         liveAssistantContentRef.current = '';
         lastFlushedLengthRef.current = 0;
         openFenceRef.current = null;
@@ -805,7 +808,8 @@ const ChatInterface: React.FC<{
             if (streamChunks) {
               const now = Date.now();
               if (!assistantHeaderAppendedRef.current) {
-                appendTranscript(<Box><Text color="green" bold>🤖 Fry:</Text></Box>);
+                // Defer committing the header to the static transcript to avoid extra spacing.
+                // Render the header inside the live preview area instead until we commit content.
                 assistantHeaderAppendedRef.current = true;
               }
               const interval = (streamIntervalMs ?? 0);
@@ -824,6 +828,10 @@ const ChatInterface: React.FC<{
                   if (idx >= 0) {
                     const complete = p.slice(0, idx + 1);
                     const display = wrapChunkForDisplay(complete);
+                    if (!headerCommittedRef.current) {
+                      appendTranscript(<Box><Text color="green" bold>🤖 Fry:</Text></Box>);
+                      headerCommittedRef.current = true;
+                    }
                     appendTranscript(<Box><MarkdownBlock content={display} /></Box>);
                     lastBlockRef.current = 'assistant';
                     lastFlushedLengthRef.current += complete.length;
@@ -833,7 +841,12 @@ const ChatInterface: React.FC<{
                   }
                   // Show raw pending remainder exactly as received (no markdown balancing).
                   if (p.length > 0) {
-                    setLivePreview(p);
+                    let disp = p;
+                    // Ensure no extra blank line before first preview content
+                    if (lastFlushedLengthRef.current === 0) {
+                      disp = disp.replace(/^(?:\r?\n)+/, '');
+                    }
+                    setLivePreview(disp);
                     setShowLivePreview(true);
                   } else {
                     // If no text remainder, but a tool call is being assembled, show its raw arguments.
@@ -845,7 +858,11 @@ const ChatInterface: React.FC<{
                     }
                     // Harmony-only: no legacy function_call args fallback
                     if ((toolRemainder || '').length > 0) {
-                      setLivePreview(toolRemainder);
+                      let disp = toolRemainder;
+                      if (lastFlushedLengthRef.current === 0) {
+                        disp = disp.replace(/^(?:\r?\n)+/, '');
+                      }
+                      setLivePreview(disp);
                       setShowLivePreview(true);
                     } else {
                       setShowLivePreview(false);
@@ -866,7 +883,12 @@ const ChatInterface: React.FC<{
                     // Harmony-only: no legacy function_call args fallback
                     previewRaw = clampRaw(toolRemainder, previewMaxLines);
                   }
-                  // Only show the live preview if there's content; avoid rendering an empty line first.
+                  // Remove any leading newlines at the very beginning of the assistant preview
+                  // to avoid an extra blank line before the first token.
+                  if (lastFlushedLengthRef.current === 0 && typeof previewRaw === 'string') {
+                    previewRaw = previewRaw.replace(/^(?:\r?\n)+/, '');
+                  }
+                  // Only show the live preview if there's content after normalization.
                   if (previewRaw && previewRaw.length > 0) {
                     setLivePreview(previewRaw);
                     setShowLivePreview(true);
@@ -929,6 +951,10 @@ const ChatInterface: React.FC<{
           const remainder = pendingRef.current;
           if (remainder.length > 0) {
             const display = wrapChunkForDisplay(remainder);
+            if (!headerCommittedRef.current) {
+              appendTranscript(<Box><Text color="green" bold>🤖 Fry:</Text></Box>);
+              headerCommittedRef.current = true;
+            }
             appendTranscript(<Box><MarkdownBlock content={display} /></Box>);
             lastBlockRef.current = 'assistant';
             lastFlushedLengthRef.current += remainder.length;
@@ -941,9 +967,9 @@ const ChatInterface: React.FC<{
           liveAssistantContentRef.current = '';
         } else {
           if ((assistantContent || '').length > 0) {
-            if (!assistantHeaderAppendedRef.current) {
+            if (!headerCommittedRef.current) {
               appendTranscript(<Box><Text color="green" bold>🤖 Fry:</Text></Box>);
-              assistantHeaderAppendedRef.current = true;
+              headerCommittedRef.current = true;
             }
             appendTranscript(<Box><MarkdownBlock content={assistantContent} /></Box>);
             lastBlockRef.current = 'assistant';
@@ -991,9 +1017,9 @@ const ChatInterface: React.FC<{
       if (isInterruptedRef.current) {
         // Flush partial content on interrupt
         const full = liveAssistantContentRef.current || '';
-        if (!assistantHeaderAppendedRef.current && full.length > 0) {
+        if (!headerCommittedRef.current && full.length > 0) {
           appendTranscript(<Box><Text color="green" bold>🤖 Fry:</Text></Box>);
-          assistantHeaderAppendedRef.current = true;
+          headerCommittedRef.current = true;
         }
         if (streamMode === 'append') {
           // Flush any full lines pending
@@ -1018,12 +1044,20 @@ const ChatInterface: React.FC<{
               }
               return md;
             })();
+            if (!headerCommittedRef.current) {
+              appendTranscript(<Box><Text color="green" bold>🤖 Fry:</Text></Box>);
+              headerCommittedRef.current = true;
+            }
             appendTranscript(<Box><MarkdownBlock content={display} /></Box>);
             lastFlushedLengthRef.current += p.length;
             pendingRef.current = '';
           }
         } else {
           if (full.length > 0) {
+            if (!headerCommittedRef.current) {
+              appendTranscript(<Box><Text color="green" bold>🤖 Fry:</Text></Box>);
+              headerCommittedRef.current = true;
+            }
             appendTranscript(<Box><MarkdownBlock content={full} /></Box>);
             lastBlockRef.current = 'assistant';
           }
@@ -1156,7 +1190,10 @@ const ChatInterface: React.FC<{
       </Box>
 
       {isProcessing && showLivePreview && (
-        <Box>
+        <Box flexDirection="column">
+          {!headerCommittedRef.current && (
+            <Text color="green" bold>🤖 Fry:</Text>
+          )}
           <Text>{livePreview}</Text>
         </Box>
       )}
