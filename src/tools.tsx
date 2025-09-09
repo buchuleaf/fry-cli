@@ -135,7 +135,7 @@ export class LocalToolExecutor {
     // Helper to run a shell and capture outputs with exit code for better decision making
     const runShell = (prog: string, progArgs: string[]) => {
       return new Promise<{ code: number | null, stdout: string, stderr: string, notFound: boolean, errorMsg?: string }>((resolve) => {
-        const proc = spawn(prog, progArgs, { cwd: this.workspaceDir, timeout: 20000 });
+        const proc = spawn(prog, progArgs, { cwd: this.workspaceDir, timeout: 60000 });
         let stdout = '';
         let stderr = '';
         proc.stdout.on('data', (d) => { stdout += d.toString(); });
@@ -249,7 +249,7 @@ export class LocalToolExecutor {
         // Use the cleaned 'code' variable here
         const pythonProcess = spawn(command, ['-c', code], {
           cwd: this.workspaceDir,
-          timeout: 20000,
+          timeout: 60000,
         });
 
         let stdout = '';
