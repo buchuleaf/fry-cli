@@ -350,7 +350,11 @@ const ChatInterface: React.FC<{
   showAnalysis: boolean;
   streamChunks: boolean;
   streamIntervalMs: number;
-}> = ({ client, sessionData, modelEndpoint, modelName, initialRateLimitStatus, onResetSession, showAnalysis, streamChunks, streamIntervalMs }) => {
+  // Limit of lines to show in the dynamic preview while streaming
+  previewMaxLines?: number;
+  // Streaming mode: 'append' appends static chunks, 'preview' shows a dynamic live block
+  streamMode?: 'append' | 'preview';
+}> = ({ client, sessionData, modelEndpoint, modelName, initialRateLimitStatus, onResetSession, showAnalysis, streamChunks, streamIntervalMs, previewMaxLines = 24, streamMode = 'append' }) => {
   const { exit } = useApp();
   const { isRawModeSupported, setRawMode } = useStdin();
   const [input, setInput] = useState('');
@@ -411,6 +415,9 @@ const ChatInterface: React.FC<{
   // Live preview shown during streaming (single dynamic block to avoid scroll yank)
   const [livePreview, setLivePreview] = useState<string>('');
   const [showLivePreview, setShowLivePreview] = useState<boolean>(false);
+  // Append-mode helpers
+  const lastFlushedLengthRef = useRef<number>(0);
+  const openFenceRef = useRef<'```' | '~~~' | null>(null);
 
   const executeToolCall = async (toolCall: ToolCall): Promise<ToolResult> => {
     const toolName = toolCall.function.name;
@@ -597,6 +604,8 @@ const ChatInterface: React.FC<{
         assistantHeaderAppendedRef.current = false;
         assistantInCodeBlockRef.current = false;
         liveAssistantContentRef.current = '';
+        lastFlushedLengthRef.current = 0;
+        openFenceRef.current = null;
 
         let assistantContent = '';
         let assistantReasoning = '';
@@ -610,9 +619,8 @@ const ChatInterface: React.FC<{
         let lastYieldTime = Date.now();
         let lastFlushTime = 0;
 
-        // Build a balanced Markdown preview without mutating history. If a fenced
-        // code block is open at the end, temporarily append a closing fence so the
-        // preview renders correctly; on the next delta, the preview is re-rendered.
+        // Build a balanced Markdown block. If a fenced code block is open at the end,
+        // temporarily append a closing fence so the block renders correctly.
         const balancedPreview = (md: string): string => {
           let marker: '```' | '~~~' | null = null;
           const lines = md.split('\n');
@@ -629,6 +637,38 @@ const ChatInterface: React.FC<{
           }
           return md;
         };
+
+        // Keep dynamic re-render size small by showing only the last N lines
+        const clampPreview = (md: string, maxLines: number): string => {
+          if (!maxLines || maxLines <= 0) return '';
+          const lines = (md || '').split('\n');
+          if (lines.length <= maxLines) return balancedPreview(md);
+          const tail = lines.slice(-maxLines);
+          const notice = '… [preview truncated; full text will appear when complete]\n';
+          return balancedPreview(notice + tail.join('\n'));
+        };
+        // Prepare an append-only chunk with markdown fence continuity:
+        // - If a code fence is open across chunks, prefix with the same fence to keep formatting.
+        // - Always balance the chunk by closing any open fence at the end so it renders standalone.
+        const wrapChunkForDisplay = (rawChunk: string): string => {
+          const startFence = openFenceRef.current;
+          const prefix = startFence ? `${startFence}\n` : '';
+          const combined = prefix + rawChunk;
+          return balancedPreview(combined);
+        };
+
+        // Update code-fence state based on raw (unmodified) content
+        const updateFenceStateFrom = (rawChunk: string) => {
+          const lines = (rawChunk || '').split('\n');
+          for (const line of lines) {
+            const m = line.match(/^\s*(```|~~~)/);
+            if (m) {
+              const cur = m[1] as '```' | '~~~';
+              if (!openFenceRef.current) openFenceRef.current = cur; else if (openFenceRef.current === cur) openFenceRef.current = null;
+            }
+          }
+        };
+
         for await (const chunk of stream) {
           if (isInterruptedRef.current) {
             break;
@@ -670,17 +710,30 @@ const ChatInterface: React.FC<{
             // Update buffered content without causing a re-render
             const updated = liveAssistantContentRef.current + delta.content;
             liveAssistantContentRef.current = updated;
-            // If streaming is enabled, update the single live preview on-every-delta
+            // If streaming is enabled, either append static chunks or update a live preview
             if (streamChunks) {
               const now = Date.now();
               if (!assistantHeaderAppendedRef.current) {
                 appendTranscript(<Box><Text color="green" bold>🤖 Fry:</Text></Box>);
                 assistantHeaderAppendedRef.current = true;
-                setShowLivePreview(true);
+                if (streamMode === 'preview') setShowLivePreview(true);
               }
-              const shouldUpdate = (streamIntervalMs ?? 0) <= 0 || (now - lastFlushTime >= streamIntervalMs);
+              const interval = (streamIntervalMs ?? 0);
+              const shouldUpdate = interval <= 0 || (now - lastFlushTime >= interval);
               if (shouldUpdate) {
-                setLivePreview(balancedPreview(liveAssistantContentRef.current));
+                if (streamMode === 'append') {
+                  const full = liveAssistantContentRef.current;
+                  const last = lastFlushedLengthRef.current;
+                  if (full.length > last) {
+                    const rawChunk = full.slice(last);
+                    const display = wrapChunkForDisplay(rawChunk);
+                    appendTranscript(<Box><MarkdownBlock content={display} /></Box>);
+                    lastFlushedLengthRef.current = full.length;
+                    updateFenceStateFrom(rawChunk);
+                  }
+                } else {
+                  setLivePreview(clampPreview(liveAssistantContentRef.current, previewMaxLines));
+                }
                 lastFlushTime = now;
               }
             }
@@ -750,18 +803,33 @@ const ChatInterface: React.FC<{
           }
         }
 
-        // End of stream; append the full assistant message as one Markdown block
-        if ((assistantContent || '').length > 0) {
-          if (!assistantHeaderAppendedRef.current) {
-            appendTranscript(<Box><Text color="green" bold>🤖 Fry:</Text></Box>);
-            assistantHeaderAppendedRef.current = true;
+        // End of stream; finalize display based on mode
+        if (streamMode === 'append') {
+          // Flush any remainder since last interval
+          const full = liveAssistantContentRef.current;
+          const last = lastFlushedLengthRef.current;
+          if (full.length > last) {
+            const rawChunk = full.slice(last);
+            const display = wrapChunkForDisplay(rawChunk);
+            appendTranscript(<Box><MarkdownBlock content={display} /></Box>);
+            lastFlushedLengthRef.current = full.length;
+            updateFenceStateFrom(rawChunk);
           }
-          // Collapse the streaming preview into a single consolidated Markdown block
-          appendTranscript(<Box><MarkdownBlock content={assistantContent} /></Box>);
-          // Hide the live preview now that the final content is appended
+          // Reset preview state
           setShowLivePreview(false);
           setLivePreview('');
           liveAssistantContentRef.current = '';
+        } else {
+          if ((assistantContent || '').length > 0) {
+            if (!assistantHeaderAppendedRef.current) {
+              appendTranscript(<Box><Text color="green" bold>🤖 Fry:</Text></Box>);
+              assistantHeaderAppendedRef.current = true;
+            }
+            appendTranscript(<Box><MarkdownBlock content={assistantContent} /></Box>);
+            setShowLivePreview(false);
+            setLivePreview('');
+            liveAssistantContentRef.current = '';
+          }
         }
 
         turnMessages.current.push(assistantMessage);
@@ -820,19 +888,46 @@ const ChatInterface: React.FC<{
     } finally {
       if (isInterruptedRef.current) {
         // Flush partial content on interrupt
-        const buffered = liveAssistantContentRef.current || '';
-        if (buffered.length > 0) {
-          if (!assistantHeaderAppendedRef.current) {
-            appendTranscript(<Box><Text color="green" bold>🤖 Fry:</Text></Box>);
-            assistantHeaderAppendedRef.current = true;
-          }
-          // Append the partial content as a single block
-          appendTranscript(<Box><MarkdownBlock content={buffered} /></Box>);
-          liveAssistantContentRef.current = '';
-          // Hide any live preview
-          setShowLivePreview(false);
-          setLivePreview('');
+        const full = liveAssistantContentRef.current || '';
+        if (!assistantHeaderAppendedRef.current && full.length > 0) {
+          appendTranscript(<Box><Text color="green" bold>🤖 Fry:</Text></Box>);
+          assistantHeaderAppendedRef.current = true;
         }
+        if (streamMode === 'append') {
+          const last = lastFlushedLengthRef.current;
+          if (full.length > last) {
+            // Flush remainder as a final chunk
+            const rawChunk = full.slice(last);
+            // Reuse balancing helpers defined in scope via closures
+            const startFence = openFenceRef.current;
+            const prefix = startFence ? `${startFence}\n` : '';
+            const combined = prefix + rawChunk;
+            // local balancedPreview equivalent inline to avoid ref confusion
+            let md = combined;
+            let marker: '```' | '~~~' | null = null;
+            for (const line of md.split('\n')) {
+              const m = line.match(/^\s*(```|~~~)/);
+              if (m) {
+                const cur = m[1] as '```' | '~~~';
+                if (!marker) marker = cur; else if (marker === cur) marker = null;
+              }
+            }
+            if (marker) {
+              if (!md.endsWith('\n')) md += '\n';
+              md += marker;
+            }
+            appendTranscript(<Box><MarkdownBlock content={md} /></Box>);
+            lastFlushedLengthRef.current = full.length;
+          }
+        } else {
+          if (full.length > 0) {
+            appendTranscript(<Box><MarkdownBlock content={full} /></Box>);
+          }
+        }
+        // Hide any live preview
+        setShowLivePreview(false);
+        setLivePreview('');
+        liveAssistantContentRef.current = '';
         appendTranscript(<Text color="yellow">✗ Response interrupted by user.</Text>);
       }
       // End of turn
@@ -1120,7 +1215,7 @@ const ApiKeyInput: React.FC<{ backendUrl: string; onAuthenticated: (sessionRespo
 };
 
 // Main App Component
-const App: React.FC<{ backendUrl: string; modelName: string; showAnalysis: boolean; streamChunks: boolean; streamIntervalMs: number }> = ({ backendUrl, modelName, showAnalysis, streamChunks, streamIntervalMs }) => {
+const App: React.FC<{ backendUrl: string; modelName: string; showAnalysis: boolean; streamChunks: boolean; streamIntervalMs: number; previewLines: number; streamMode: 'append' | 'preview' }> = ({ backendUrl, modelName, showAnalysis, streamChunks, streamIntervalMs, previewLines, streamMode }) => {
   const [stage, setStage] = useState<'endpoint' | 'auth' | 'chat'>('endpoint');
   const [modelEndpoint, setModelEndpoint] = useState<string | null>(null);
   const [sessionData, setSessionData] = useState<SessionData | null>(null);
@@ -1171,6 +1266,8 @@ const App: React.FC<{ backendUrl: string; modelName: string; showAnalysis: boole
           showAnalysis={showAnalysis}
           streamChunks={streamChunks}
           streamIntervalMs={streamIntervalMs}
+          streamMode={streamMode}
+          previewMaxLines={previewLines}
           onResetSession={(data) => {
             setSessionData(data);
             // Reset initial rate limit display; ChatInterface also tracks its own status
@@ -1191,7 +1288,9 @@ const cli = meow(`
     --model, -m    Model name (default: gpt-4)
     --show-analysis, -a  Show chain-of-thought (default: true)
     --stream, -s   Stream assistant output as tokens arrive (default: true)
-    --stream-interval  Interval in ms for streaming chunks; set to 0 for flush-on-every-delta (default: 0)
+    --stream-interval  Interval in ms for streaming chunks; set to 0 for flush-on-every-delta (default: 100)
+    --preview-lines, -p  Max lines shown in live preview while streaming (default: 24)
+    --stream-mode       Streaming mode: 'append' or 'preview' (default: 'append')
     --no-update     Skip automatic update check
 
   Examples
@@ -1223,6 +1322,15 @@ const cli = meow(`
       type: 'number',
       default: 0
     },
+    streamMode: {
+      type: 'string',
+      default: 'append'
+    },
+    previewLines: {
+      type: 'number',
+      shortFlag: 'p',
+      default: 24
+    },
     noUpdate: {
       type: 'boolean',
       default: false
@@ -1244,6 +1352,8 @@ render(
     showAnalysis={Boolean(cli.flags.showAnalysis)}
     streamChunks={Boolean(cli.flags.stream)}
     streamIntervalMs={Number.isFinite(cli.flags.streamInterval) ? Number(cli.flags.streamInterval) : 0}
+    previewLines={Number.isFinite(cli.flags.previewLines) ? Number(cli.flags.previewLines) : 24}
+    streamMode={(cli.flags.streamMode === 'preview' ? 'preview' : 'append')}
   />,
   { exitOnCtrlC: false }
 );
