@@ -744,10 +744,8 @@ const ChatInterface: React.FC<{
                   // Update tiny dynamic tail with current pending (no markdown)
                   const tail = pendingRef.current || '';
                   if (tail.length > 0) {
-                    // Limit to terminal width to avoid wrapping churn
-                    const max = Math.max(20, Math.min((process.stdout?.columns ?? 80), 120));
-                    const shown = tail.length > max ? tail.slice(-max) : tail;
-                    setLivePreview(shown);
+                    // Do not truncate: show the entire pending tail (Ink will wrap as needed)
+                    setLivePreview(tail);
                     setShowLivePreview(true);
                   } else {
                     setShowLivePreview(false);
@@ -1070,7 +1068,8 @@ const ChatInterface: React.FC<{
       {isProcessing && showLivePreview && (
         streamMode === 'append' ? (
           <Box>
-            <Text dimColor>{livePreview}</Text>
+            <Text dimColor>{livePreview.slice(0, Math.max(0, livePreview.length - 16))}</Text>
+            <Text>{livePreview.slice(-16)}</Text>
           </Box>
         ) : (
           <Box>
