@@ -465,7 +465,7 @@ const ChatInterface: React.FC<{
       // Append tool execution start
       appendTranscript(
         <Box>
-          <Text color="yellow"><br />🔧 Executing: </Text>
+          <Text color="yellow">🔧 Executing: </Text>
           <Text color="cyan" bold>{toolName}({argsStr})</Text>
         </Box>
       );
@@ -687,6 +687,48 @@ const ChatInterface: React.FC<{
           return md;
         };
 
+        // Extract the final-channel message content (no Harmony tags)
+        const extractHarmonyFinal = (text: string): string => {
+          if (typeof text !== 'string') return '';
+          const pattern = /<\|channel\|>final(?:\s+[a-zA-Z]+)?<\|message\|>/g;
+          let lastEnd = -1;
+          let m: RegExpExecArray | null;
+          while ((m = pattern.exec(text)) !== null) {
+            lastEnd = pattern.lastIndex;
+          }
+          if (lastEnd === -1) return text;
+          const endReturn = text.indexOf('<|return|>', lastEnd);
+          const endEnd = text.indexOf('<|end|>', lastEnd);
+          const candidates = [endReturn, endEnd].filter(i => i >= 0);
+          const end = candidates.length > 0 ? Math.min(...candidates) : text.length;
+          return text.slice(lastEnd, end);
+        };
+
+        // Extract the latest analysis-channel message content before a tool call (no Harmony tags)
+        const extractHarmonyAnalysis = (text: string): string => {
+          if (typeof text !== 'string') return '';
+          const callIdx = text.indexOf('<|call|>');
+          const searchEnd = callIdx >= 0 ? callIdx : text.length;
+          const pattern = /<\|channel\|>analysis(?:\s+[a-zA-Z]+)?<\|message\|>/g;
+          let lastHeaderEnd = -1;
+          let m: RegExpExecArray | null;
+          while ((m = pattern.exec(text)) !== null) {
+            if (pattern.lastIndex <= searchEnd) {
+              lastHeaderEnd = pattern.lastIndex;
+            } else {
+              break;
+            }
+          }
+          if (lastHeaderEnd === -1) {
+            // Fallback: return raw text up to call, stripped of obvious markers
+            const raw = text.slice(0, searchEnd);
+            return raw.replaceAll('<|start|>', '').replaceAll('<|end|>', '').replaceAll('<|message|>', '');
+          }
+          const endIdx = text.indexOf('<|end|>', lastHeaderEnd);
+          const sliceEnd = (endIdx >= 0 && endIdx <= searchEnd) ? endIdx : searchEnd;
+          return text.slice(lastHeaderEnd, sliceEnd);
+        };
+
         // Keep dynamic re-render size small by showing only the last N lines (markdown mode)
         const clampPreview = (md: string, maxLines: number): string => {
           // If maxLines <= 0, show full live preview (no truncation)
@@ -853,11 +895,19 @@ const ChatInterface: React.FC<{
             tc.id = `call_${Math.random().toString(36).slice(2, 10)}`;
           }
         }
+        // Harmony template assumes max 1 tool call per assistant message.
+        // If multiple streamed, keep only the first to preserve template invariants.
+        if (toolCalls.length > 1) {
+          toolCalls.splice(1);
+        }
 
         // This is the message that will be sent back to the backend in the next turn.
-        // Provide only the assistant text (no Harmony tags). If tool_calls are present,
-        // this text represents the analysis segment preceding the call.
-        const finalOnly = assistantContent;
+        // Provide only plain text (no Harmony tags).
+        // - If tool_calls exist: include the latest analysis text preceding the call.
+        // - Else: include the final text content.
+        const finalOnly = (toolCalls.length > 0)
+          ? extractHarmonyAnalysis(assistantContent)
+          : extractHarmonyFinal(assistantContent);
         // Build the assistant message for history/next turn.
         // Root-cause fix: if the model made tool calls and did NOT produce a final message,
         // do NOT include an empty string content — omit content entirely to avoid confusing
@@ -916,7 +966,7 @@ const ChatInterface: React.FC<{
           break;
         }
 
-        // Execute tools
+        // Execute tools (Harmony: at most one per assistant message)
         for (const toolCall of toolCalls) {
           const result = await executeToolCall(toolCall);
           
@@ -1118,20 +1168,16 @@ const ChatInterface: React.FC<{
   
       <Box marginTop={1} justifyContent="space-between">
         <Box flexDirection="column">
-          <Box>
-            <Text dimColor>
-              Commands: /dashboard, /buy, /clear{'\n'}
-              Ctrl + C to interrupt
-            </Text>
-          </Box>
+          <Text dimColor>Commands: /dashboard, /buy, /clear</Text>
+          <Text dimColor>Ctrl + C to interrupt</Text>
         </Box>
         {rateLimitStatus && (
-          <Text dimColor>
-            Tool Calls: {rateLimitStatus.remaining} {'\n'}
-            (resets in{' '}
-            {Math.floor(rateLimitStatus.reset_in_seconds / 3600)}h{' '}
-            {Math.ceil((rateLimitStatus.reset_in_seconds % 3600) / 60)}m)
-          </Text>
+          <Box flexDirection="column" alignItems="flex-end">
+            <Text dimColor>Tool Calls: {rateLimitStatus.remaining}</Text>
+            <Text dimColor>
+              (resets in {Math.floor(rateLimitStatus.reset_in_seconds / 3600)}h {Math.ceil((rateLimitStatus.reset_in_seconds % 3600) / 60)}m)
+            </Text>
+          </Box>
         )}
       </Box>
     </Box>
