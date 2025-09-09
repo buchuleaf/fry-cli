@@ -102,7 +102,8 @@ export class LocalToolExecutor {
   }
 
   private async handleWorkspaceTool(args: any, toolCallId: string): Promise<ToolResult> {
-    const action = (args.action || '').toLowerCase();
+    const actionRaw = String(args.action || '');
+    const action = actionRaw.trim().toLowerCase().replace(/[\s-]+/g, '_');
     switch (action) {
       case 'ls':
         return this.handleLs({ path: args.path || '.' }, toolCallId);
@@ -115,11 +116,15 @@ export class LocalToolExecutor {
       case 'search_files':
         return this.handleSearchFiles({ pattern: args.pattern, file_pattern: args.file_pattern, path: args.path }, toolCallId);
       case 'apply_patch':
+      case 'applypatch':
+      case 'apply__patch':
+      case 'apply_patch_':
+      case '_apply_patch':
         return this.handleApplyPatch({ patch: args.patch });
       // No 'read_chunk' action in simplified API
       // fallthrough
       default:
-        return { status: 'error', data: "Unknown or missing 'action'. Use one of: ls, read, write, mkdir, search_files, apply_patch." };
+        return { status: 'error', data: `Unknown or missing 'action'. Use one of: ls, read, write, mkdir, search_files, apply_patch. Received: '${actionRaw}'` };
     }
   }
 
@@ -285,7 +290,12 @@ export class LocalToolExecutor {
   }
 
   private async handleFsTool(functionName: string, args: any, toolCallId: string): Promise<ToolResult> {
-    const command = functionName.split('.').pop()!;
+    const raw = functionName.split('.').pop() || '';
+    // Normalize command names defensively to tolerate minor formatting variations
+    // - trim whitespace
+    // - lowercase
+    // - convert hyphens/spaces to underscores
+    const command = raw.trim().toLowerCase().replace(/[\s-]+/g, '_');
 
     switch (command) {
       case 'ls':
@@ -299,9 +309,13 @@ export class LocalToolExecutor {
       case 'search_files':
         return await this.handleSearchFiles(args, toolCallId);
       case 'apply_patch':
+      case 'applypatch': // tolerate missing underscore
+      case 'apply__patch': // tolerate accidental double underscore
+      case 'apply_patch_': // tolerate trailing underscore
+      case '_apply_patch': // tolerate leading underscore
         return await this.handleApplyPatch(args);
       default:
-        return { status: 'error', data: `Unknown fs command: ${command}` };
+        return { status: 'error', data: `Unknown fs command: ${raw}` };
     }
   }
 
