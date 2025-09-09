@@ -354,7 +354,7 @@ const ChatInterface: React.FC<{
   previewMaxLines?: number;
   // Streaming mode: 'append' appends static chunks, 'preview' shows a dynamic live block
   streamMode?: 'append' | 'preview';
-}> = ({ client, sessionData, modelEndpoint, modelName, initialRateLimitStatus, onResetSession, showAnalysis, streamChunks, streamIntervalMs, previewMaxLines = 24, streamMode = 'append' }) => {
+}> = ({ client, sessionData, modelEndpoint, modelName, initialRateLimitStatus, onResetSession, showAnalysis, streamChunks, streamIntervalMs, previewMaxLines = 0, streamMode = 'preview' }) => {
   const { exit } = useApp();
   const { isRawModeSupported, setRawMode } = useStdin();
   const [input, setInput] = useState('');
@@ -644,7 +644,8 @@ const ChatInterface: React.FC<{
 
         // Keep dynamic re-render size small by showing only the last N lines
         const clampPreview = (md: string, maxLines: number): string => {
-          if (!maxLines || maxLines <= 0) return '';
+          // If maxLines <= 0, show full live preview (no truncation)
+          if (!Number.isFinite(maxLines) || maxLines <= 0) return balancedPreview(md);
           const lines = (md || '').split('\n');
           if (lines.length <= maxLines) return balancedPreview(md);
           const tail = lines.slice(-maxLines);
@@ -744,7 +745,7 @@ const ChatInterface: React.FC<{
                   // Update tiny dynamic tail with current pending (no markdown)
                   const tail = pendingRef.current || '';
                   if (tail.length > 0) {
-                    // Do not truncate: show the entire pending tail (Ink will wrap as needed)
+                    // Pass full tail; render truncates to one line to avoid wrap artifacts
                     setLivePreview(tail);
                     setShowLivePreview(true);
                   } else {
@@ -1068,8 +1069,11 @@ const ChatInterface: React.FC<{
       {isProcessing && showLivePreview && (
         streamMode === 'append' ? (
           <Box>
-            <Text dimColor>{livePreview.slice(0, Math.max(0, livePreview.length - 16))}</Text>
-            <Text>{livePreview.slice(-16)}</Text>
+            {/* Keep preview to a single line to avoid wrap artifacts */}
+            <Text wrap="truncate-start">
+              <Text dimColor>{livePreview.slice(0, Math.max(0, livePreview.length - 16))}</Text>
+              <Text>{livePreview.slice(-16)}</Text>
+            </Text>
           </Box>
         ) : (
           <Box>
@@ -1317,8 +1321,8 @@ const cli = meow(`
     --show-analysis, -a  Show chain-of-thought (default: true)
     --stream, -s   Stream assistant output as tokens arrive (default: true)
     --stream-interval  Interval in ms for streaming chunks; set to 0 for flush-on-every-delta (default: 100)
-    --preview-lines, -p  Max lines shown in live preview while streaming (default: 24)
-    --stream-mode       Streaming mode: 'append' or 'preview' (default: 'append')
+    --preview-lines, -p  Max lines shown in live preview while streaming (0 = unlimited, default: 0)
+    --stream-mode       Streaming mode: 'append' or 'preview' (default: 'preview')
     --no-update     Skip automatic update check
 
   Examples
@@ -1352,12 +1356,12 @@ const cli = meow(`
     },
     streamMode: {
       type: 'string',
-      default: 'append'
+      default: 'preview'
     },
     previewLines: {
       type: 'number',
       shortFlag: 'p',
-      default: 24
+      default: 0
     },
     noUpdate: {
       type: 'boolean',
@@ -1380,8 +1384,8 @@ render(
     showAnalysis={Boolean(cli.flags.showAnalysis)}
     streamChunks={Boolean(cli.flags.stream)}
     streamIntervalMs={Number.isFinite(cli.flags.streamInterval) ? Number(cli.flags.streamInterval) : 0}
-    previewLines={Number.isFinite(cli.flags.previewLines) ? Number(cli.flags.previewLines) : 24}
-    streamMode={(cli.flags.streamMode === 'preview' ? 'preview' : 'append')}
+    previewLines={Number.isFinite(cli.flags.previewLines) ? Number(cli.flags.previewLines) : 0}
+    streamMode={(cli.flags.streamMode === 'append' ? 'append' : 'preview')}
   />,
   { exitOnCtrlC: false }
 );
