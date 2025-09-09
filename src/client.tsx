@@ -418,6 +418,8 @@ const ChatInterface: React.FC<{
   // Append-mode helpers
   const lastFlushedLengthRef = useRef<number>(0);
   const openFenceRef = useRef<'```' | '~~~' | null>(null);
+  const consumedUpToRef = useRef<number>(0);
+  const pendingRef = useRef<string>('');
 
   const executeToolCall = async (toolCall: ToolCall): Promise<ToolResult> => {
     const toolName = toolCall.function.name;
@@ -606,6 +608,8 @@ const ChatInterface: React.FC<{
         liveAssistantContentRef.current = '';
         lastFlushedLengthRef.current = 0;
         openFenceRef.current = null;
+        consumedUpToRef.current = 0;
+        pendingRef.current = '';
 
         let assistantContent = '';
         let assistantReasoning = '';
@@ -723,13 +727,20 @@ const ChatInterface: React.FC<{
               if (shouldUpdate) {
                 if (streamMode === 'append') {
                   const full = liveAssistantContentRef.current;
-                  const last = lastFlushedLengthRef.current;
-                  if (full.length > last) {
-                    const rawChunk = full.slice(last);
-                    const display = wrapChunkForDisplay(rawChunk);
+                  const consumed = consumedUpToRef.current;
+                  if (full.length > consumed) {
+                    pendingRef.current += full.slice(consumed);
+                    consumedUpToRef.current = full.length;
+                  }
+                  const p = pendingRef.current;
+                  const idx = p.lastIndexOf('\n');
+                  if (idx >= 0) {
+                    const complete = p.slice(0, idx + 1);
+                    const display = wrapChunkForDisplay(complete);
                     appendTranscript(<Box><MarkdownBlock content={display} /></Box>);
-                    lastFlushedLengthRef.current = full.length;
-                    updateFenceStateFrom(rawChunk);
+                    lastFlushedLengthRef.current += complete.length;
+                    pendingRef.current = p.slice(idx + 1);
+                    updateFenceStateFrom(complete);
                   }
                 } else {
                   setLivePreview(clampPreview(liveAssistantContentRef.current, previewMaxLines));
@@ -805,15 +816,14 @@ const ChatInterface: React.FC<{
 
         // End of stream; finalize display based on mode
         if (streamMode === 'append') {
-          // Flush any remainder since last interval
-          const full = liveAssistantContentRef.current;
-          const last = lastFlushedLengthRef.current;
-          if (full.length > last) {
-            const rawChunk = full.slice(last);
-            const display = wrapChunkForDisplay(rawChunk);
+          // Flush any remainder (including partial line)
+          const remainder = pendingRef.current;
+          if (remainder.length > 0) {
+            const display = wrapChunkForDisplay(remainder);
             appendTranscript(<Box><MarkdownBlock content={display} /></Box>);
-            lastFlushedLengthRef.current = full.length;
-            updateFenceStateFrom(rawChunk);
+            lastFlushedLengthRef.current += remainder.length;
+            updateFenceStateFrom(remainder);
+            pendingRef.current = '';
           }
           // Reset preview state
           setShowLivePreview(false);
@@ -894,30 +904,31 @@ const ChatInterface: React.FC<{
           assistantHeaderAppendedRef.current = true;
         }
         if (streamMode === 'append') {
-          const last = lastFlushedLengthRef.current;
-          if (full.length > last) {
-            // Flush remainder as a final chunk
-            const rawChunk = full.slice(last);
-            // Reuse balancing helpers defined in scope via closures
-            const startFence = openFenceRef.current;
-            const prefix = startFence ? `${startFence}\n` : '';
-            const combined = prefix + rawChunk;
-            // local balancedPreview equivalent inline to avoid ref confusion
-            let md = combined;
-            let marker: '```' | '~~~' | null = null;
-            for (const line of md.split('\n')) {
-              const m = line.match(/^\s*(```|~~~)/);
-              if (m) {
-                const cur = m[1] as '```' | '~~~';
-                if (!marker) marker = cur; else if (marker === cur) marker = null;
+          // Flush any full lines pending
+          const p = pendingRef.current;
+          if (p.length > 0) {
+            const display = (() => {
+              const startFence = openFenceRef.current;
+              const prefix = startFence ? `${startFence}\n` : '';
+              // Balance code fences locally
+              let md = prefix + p;
+              let marker: '```' | '~~~' | null = null;
+              for (const line of md.split('\n')) {
+                const m = line.match(/^\s*(```|~~~)/);
+                if (m) {
+                  const cur = m[1] as '```' | '~~~';
+                  if (!marker) marker = cur; else if (marker === cur) marker = null;
+                }
               }
-            }
-            if (marker) {
-              if (!md.endsWith('\n')) md += '\n';
-              md += marker;
-            }
-            appendTranscript(<Box><MarkdownBlock content={md} /></Box>);
-            lastFlushedLengthRef.current = full.length;
+              if (marker) {
+                if (!md.endsWith('\n')) md += '\n';
+                md += marker;
+              }
+              return md;
+            })();
+            appendTranscript(<Box><MarkdownBlock content={display} /></Box>);
+            lastFlushedLengthRef.current += p.length;
+            pendingRef.current = '';
           }
         } else {
           if (full.length > 0) {
