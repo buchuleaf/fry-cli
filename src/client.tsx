@@ -448,11 +448,8 @@ const ChatInterface: React.FC<{
     }
     // No read_chunk defaulting needed with simplified API
 
-    // If the last block was assistant content, insert a spacer line
-    if (lastBlockRef.current === 'assistant') {
-      appendTranscript(<Text> </Text>);
-      lastBlockRef.current = 'other';
-    }
+    // Determine if we should visually separate from assistant content
+    const needsSpacer = (lastBlockRef.current === 'assistant');
 
     try {
       const args = JSON.parse(toolCall.function.arguments);
@@ -464,7 +461,7 @@ const ChatInterface: React.FC<{
         .join(', ');
       // Append tool execution start
       appendTranscript(
-        <Box>
+        <Box marginTop={needsSpacer ? 1 : 0}>
           <Text color="yellow">🔧 Executing: </Text>
           <Text color="cyan" bold>{toolName}({argsStr})</Text>
         </Box>
@@ -472,7 +469,7 @@ const ChatInterface: React.FC<{
       lastBlockRef.current = 'tool';
     } catch {
       appendTranscript(
-        <Box>
+        <Box marginTop={needsSpacer ? 1 : 0}>
           <Text color="yellow">🔧 Executing: </Text>
           <Text color="cyan" bold>{toolName}(...) </Text>
         </Box>
@@ -869,8 +866,14 @@ const ChatInterface: React.FC<{
                     // Harmony-only: no legacy function_call args fallback
                     previewRaw = clampRaw(toolRemainder, previewMaxLines);
                   }
-                  setLivePreview(previewRaw || '');
-                  setShowLivePreview(true);
+                  // Only show the live preview if there's content; avoid rendering an empty line first.
+                  if (previewRaw && previewRaw.length > 0) {
+                    setLivePreview(previewRaw);
+                    setShowLivePreview(true);
+                  } else {
+                    setShowLivePreview(false);
+                    setLivePreview('');
+                  }
                 }
                 lastFlushTime = now;
               }
@@ -1392,7 +1395,7 @@ const cli = meow(`
     --stream, -s   Stream assistant output as tokens arrive (default: true)
     --stream-interval  Interval in ms for streaming chunks; set to 0 for flush-on-every-delta (default: 100)
     --preview-lines, -p  Max lines shown in live preview while streaming (0 = unlimited, default: 0)
-    --stream-mode       Streaming mode: 'append' or 'preview' (default: 'append')
+    --stream-mode       Streaming mode: 'append' or 'preview' (default: 'preview')
     --no-update     Skip automatic update check
 
   Examples
@@ -1421,7 +1424,7 @@ const cli = meow(`
     },
     streamMode: {
       type: 'string',
-      default: 'append'
+      default: 'preview'
     },
     previewLines: {
       type: 'number',
