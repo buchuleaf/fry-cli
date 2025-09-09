@@ -760,7 +760,8 @@ const ChatInterface: React.FC<{
                     pendingRef.current += full.slice(consumed);
                     consumedUpToRef.current = full.length;
                   }
-                  const p = pendingRef.current;
+                  let p = pendingRef.current;
+                  // Flush any complete lines first
                   const idx = Math.max(p.lastIndexOf('\n'), p.lastIndexOf('\r'));
                   if (idx >= 0) {
                     const complete = p.slice(0, idx + 1);
@@ -769,19 +770,22 @@ const ChatInterface: React.FC<{
                     lastFlushedLengthRef.current += complete.length;
                     pendingRef.current = p.slice(idx + 1);
                     updateFenceStateFrom(complete);
+                    p = pendingRef.current;
                   }
-                  // Update tiny dynamic tail with current pending (no markdown)
-                  const tail = pendingRef.current || '';
-                  if (tail.length > 0) {
-                    // Pass full tail; render truncates to one line to avoid wrap artifacts
-                    setLivePreview(tail);
+                  // Show the current remainder live as markdown so the user sees
+                  // the entire response, including the last partial line.
+                  if (p.length > 0) {
+                    const previewDisplay = wrapChunkForDisplay(p);
+                    setLivePreview(previewDisplay);
                     setShowLivePreview(true);
                   } else {
                     setShowLivePreview(false);
                     setLivePreview('');
                   }
                 } else {
-                  setLivePreview(clampPreview(liveAssistantContentRef.current, previewMaxLines));
+                  // In preview mode, show the full content live (balanced markdown)
+                  const previewDisplay = clampPreview(liveAssistantContentRef.current, previewMaxLines);
+                  setLivePreview(previewDisplay);
                   setShowLivePreview(true);
                 }
                 lastFlushTime = now;
@@ -1101,19 +1105,9 @@ const ChatInterface: React.FC<{
       </Box>
 
       {isProcessing && showLivePreview && (
-        streamMode === 'append' ? (
-          <Box>
-            {/* Keep preview to a single line to avoid wrap artifacts */}
-            <Text wrap="truncate-start">
-              <Text dimColor>{livePreview.slice(0, Math.max(0, livePreview.length - 16))}</Text>
-              <Text>{livePreview.slice(-16)}</Text>
-            </Text>
-          </Box>
-        ) : (
-          <Box>
-            <MarkdownBlock content={livePreview} />
-          </Box>
-        )
+        <Box>
+          <MarkdownBlock content={livePreview} />
+        </Box>
       )}
 
       {!isProcessing && (
@@ -1356,7 +1350,7 @@ const cli = meow(`
     --stream, -s   Stream assistant output as tokens arrive (default: true)
     --stream-interval  Interval in ms for streaming chunks; set to 0 for flush-on-every-delta (default: 100)
     --preview-lines, -p  Max lines shown in live preview while streaming (0 = unlimited, default: 0)
-    --stream-mode       Streaming mode: 'append' or 'preview' (default: 'preview')
+    --stream-mode       Streaming mode: 'append' or 'preview' (default: 'append')
     --no-update     Skip automatic update check
 
   Examples
@@ -1390,7 +1384,7 @@ const cli = meow(`
     },
     streamMode: {
       type: 'string',
-      default: 'preview'
+      default: 'append'
     },
     previewLines: {
       type: 'number',
