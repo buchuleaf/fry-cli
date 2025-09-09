@@ -130,6 +130,9 @@ export class LocalToolExecutor {
 
   private async handleShellTool(args: any, toolCallId: string): Promise<ToolResult> {
     const command = args.command || '';
+    const page = Math.max(1, parseInt(args.page) || 1);
+    const pageSize = Math.min(5000, Math.max(1, parseInt(args.page_size) || 2000)); // Default 2000, max 5000
+    
     if (!command) return { status: 'error', data: 'No command provided.' };
 
     // Helper to run a shell and capture outputs with exit code for better decision making
@@ -152,9 +155,45 @@ export class LocalToolExecutor {
       });
     };
 
+    const paginateOutput = (content: string, page: number, pageSize: number) => {
+      const totalChars = content.length;
+      const totalPages = Math.ceil(totalChars / pageSize) || 1;
+      
+      // Adjust page to be within valid range
+      const actualPage = Math.max(1, Math.min(page, totalPages));
+      
+      const startIdx = (actualPage - 1) * pageSize;
+      const endIdx = Math.min(startIdx + pageSize, totalChars);
+      const pageContent = content.slice(startIdx, endIdx);
+      
+      return {
+        content: pageContent,
+        page: actualPage,
+        page_size: pageSize,
+        total_chars: totalChars,
+        total_pages: totalPages,
+        has_prev: actualPage > 1,
+        has_next: actualPage < totalPages
+      };
+    };
+
     const toResult = (code: number | null, stdout: string, stderr: string): ToolResult => {
       const output = `EXIT: ${code}\nSTDOUT:\n${stdout}\nSTDERR:\n${stderr}`;
-      return this.chunkContent(output, toolCallId, { lineSafe: true });
+      
+      // Always paginate the output to preserve all information
+      const paginated = paginateOutput(output, page, pageSize);
+      return { 
+        status: 'success', 
+        data: {
+          content: paginated.content,
+          page: paginated.page,
+          page_size: paginated.page_size,
+          total_chars: paginated.total_chars,
+          total_pages: paginated.total_pages,
+          has_prev: paginated.has_prev,
+          has_next: paginated.has_next
+        }
+      };
     };
 
     // Non-Windows: prefer bash, then sh
@@ -235,6 +274,9 @@ export class LocalToolExecutor {
 
   private async handlePythonTool(args: any, toolCallId: string): Promise<ToolResult> {
     let code = args.code || '';
+    const page = Math.max(1, parseInt(args.page) || 1);
+    const pageSize = Math.min(5000, Math.max(1, parseInt(args.page_size) || 2000)); // Default 2000, max 5000
+    
     if (!code) return { status: 'error', data: 'No code provided.' };
 
     // The model is sometimes wrapping code in a shell command.
@@ -243,6 +285,28 @@ export class LocalToolExecutor {
     if (hereDocMatch && hereDocMatch[1]) {
       code = hereDocMatch[1].trim();
     }
+
+    const paginateOutput = (content: string, page: number, pageSize: number) => {
+      const totalChars = content.length;
+      const totalPages = Math.ceil(totalChars / pageSize) || 1;
+      
+      // Adjust page to be within valid range
+      const actualPage = Math.max(1, Math.min(page, totalPages));
+      
+      const startIdx = (actualPage - 1) * pageSize;
+      const endIdx = Math.min(startIdx + pageSize, totalChars);
+      const pageContent = content.slice(startIdx, endIdx);
+      
+      return {
+        content: pageContent,
+        page: actualPage,
+        page_size: pageSize,
+        total_chars: totalChars,
+        total_pages: totalPages,
+        has_prev: actualPage > 1,
+        has_next: actualPage < totalPages
+      };
+    };
 
     const tryCommand = (command: string): Promise<ToolResult> => {
       return new Promise((resolve) => {
@@ -265,7 +329,21 @@ export class LocalToolExecutor {
 
         pythonProcess.on('close', (exitCode) => {
           const output = `EXIT: ${exitCode}\nSTDOUT:\n${stdout}\nSTDERR:\n${stderr}`;
-          resolve(this.chunkContent(output, toolCallId, { lineSafe: true }));
+          
+          // Always paginate the output to preserve all information
+          const paginated = paginateOutput(output, page, pageSize);
+          resolve({ 
+            status: 'success', 
+            data: {
+              content: paginated.content,
+              page: paginated.page,
+              page_size: paginated.page_size,
+              total_chars: paginated.total_chars,
+              total_pages: paginated.total_pages,
+              has_prev: paginated.has_prev,
+              has_next: paginated.has_next
+            }
+          });
         });
 
         pythonProcess.on('error', (error: any) => {
