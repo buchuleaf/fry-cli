@@ -188,6 +188,15 @@ const MarkdownBlock: React.FC<{ content: string }> = React.memo(({ content }) =>
   } catch {
     out = md;
   }
+  // Avoid injecting artificial trailing newlines: if the original content
+  // did not end with a newline, trim all trailing newlines in the rendered
+  // output. If it did end with a newline, normalize to exactly one.
+  const inputEndsWithNl = /\r?\n$/.test(md);
+  if (inputEndsWithNl) {
+    out = out.replace(/\n+$/g, '\n');
+  } else {
+    out = out.replace(/\n+$/g, '');
+  }
   return <Text>{out}</Text>;
 });
 
@@ -208,8 +217,6 @@ interface Message {
   tool_calls?: ToolCall[];
   tool_call_id?: string;
   name?: string;
-  // Optional chain-of-thought field (not displayed). Used to help prompt rendering on backend.
-  thinking?: string;
 }
 
 // API Client
@@ -347,14 +354,13 @@ const ChatInterface: React.FC<{
   modelName: string;
   initialRateLimitStatus: RateLimitStatus | null;
   onResetSession: (data: SessionData) => void;
-  showAnalysis: boolean;
   streamChunks: boolean;
   streamIntervalMs: number;
   // Limit of lines to show in the dynamic preview while streaming
   previewMaxLines?: number;
   // Streaming mode: 'append' appends static chunks, 'preview' shows a dynamic live block
   streamMode?: 'append' | 'preview';
-}> = ({ client, sessionData, modelEndpoint, modelName, initialRateLimitStatus, onResetSession, showAnalysis, streamChunks, streamIntervalMs, previewMaxLines = 0, streamMode = 'preview' }) => {
+}> = ({ client, sessionData, modelEndpoint, modelName, initialRateLimitStatus, onResetSession, streamChunks, streamIntervalMs, previewMaxLines = 0, streamMode = 'preview' }) => {
   const { exit } = useApp();
   const { isRawModeSupported, setRawMode } = useStdin();
   const [input, setInput] = useState('');
@@ -399,6 +405,7 @@ const ChatInterface: React.FC<{
         Working directory: {process.cwd()}
       </Text>
     );
+    lastBlockRef.current = 'system';
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -417,7 +424,7 @@ const ChatInterface: React.FC<{
   // Streaming state: we only buffer in a ref to avoid re-renders
   const liveAssistantContentRef = useRef<string>('');
   const assistantHeaderAppendedRef = useRef<boolean>(false);
-  const assistantInCodeBlockRef = useRef<boolean>(false);
+  // Harmony-specific: no special code-block reasoning handling needed beyond markdown rendering
   // Live preview shown during streaming (single dynamic block to avoid scroll yank)
   const [livePreview, setLivePreview] = useState<string>('');
   const [showLivePreview, setShowLivePreview] = useState<boolean>(false);
@@ -426,6 +433,8 @@ const ChatInterface: React.FC<{
   const openFenceRef = useRef<'```' | '~~~' | null>(null);
   const consumedUpToRef = useRef<number>(0);
   const pendingRef = useRef<string>('');
+  // Track the last type of transcript block to control spacing before tool logs
+  const lastBlockRef = useRef<'assistant' | 'tool' | 'user' | 'system' | 'other' | null>(null);
 
   const executeToolCall = async (toolCall: ToolCall): Promise<ToolResult> => {
     const toolName = toolCall.function.name;
@@ -439,6 +448,12 @@ const ChatInterface: React.FC<{
     }
     // No read_chunk defaulting needed with simplified API
 
+    // If the last block was assistant content, insert a spacer line
+    if (lastBlockRef.current === 'assistant') {
+      appendTranscript(<Text> </Text>);
+      lastBlockRef.current = 'other';
+    }
+
     try {
       const args = JSON.parse(toolCall.function.arguments);
       const argsStr = Object.entries(args)
@@ -450,10 +465,11 @@ const ChatInterface: React.FC<{
       // Append tool execution start
       appendTranscript(
         <Box>
-          <Text color="yellow">🔧 Executing: </Text>
+          <Text color="yellow"><br />🔧 Executing: </Text>
           <Text color="cyan" bold>{toolName}({argsStr})</Text>
         </Box>
       );
+      lastBlockRef.current = 'tool';
     } catch {
       appendTranscript(
         <Box>
@@ -461,6 +477,7 @@ const ChatInterface: React.FC<{
           <Text color="cyan" bold>{toolName}(...) </Text>
         </Box>
       );
+      lastBlockRef.current = 'tool';
     }
 
     let result: ToolResult;
@@ -597,8 +614,7 @@ const ChatInterface: React.FC<{
     isInterruptedRef.current = false;
     conversationHistory.current.push({ role: 'user', content: userInput });
     turnMessages.current = [{ role: 'user', content: userInput }];
-    // Accumulate reasoning across tool-call loops until a final message is produced
-    let accumulatedReasoning = '';
+    // Harmony: we do not track/display CoT separately; backend normalizes history
     
     try {
       // Send the root directory listing (the directory where 'fry' was run)
@@ -616,23 +632,27 @@ const ChatInterface: React.FC<{
         if (isInterruptedRef.current) break;
         
         // Stream response from LLM
-        // Ensure the server-side Harmony template appends an assistant generation prompt
-        // after the provided messages (especially after tool outputs). Many Harmony-enabled
-        // servers honor `add_generation_prompt` in the request body.
+        // Infer builtin tools from tool list for template kwargs
+        const builtinToolsKw = Array.from(new Set(
+          (toolsForLlm || [])
+            .map((t: any) => t?.function?.name || '')
+            .filter((n: string) => n.startsWith('browser.') || n === 'python')
+            .map((n: string) => (n.startsWith('browser.') ? 'browser' : 'python'))
+        ));
+
         const stream = await (openaiClient.current.chat.completions as any).create({
           model: modelName,
           messages: messagesForLlm,
           tools: toolsForLlm,
           tool_choice: 'auto',
           stream: true,
-          // Request that the server include reasoning tokens in the stream
-          extra_body: { add_generation_prompt: true, reasoning: { exclude: false } }
+          // Let the host template handle assistant prompt; add generation prompt when supported
+          extra_body: { add_generation_prompt: true, builtin_tools: builtinToolsKw }
         });
 
         // Initialize per-token streaming state. We avoid UI re-renders during streaming
         // and only append at a throttle interval (if enabled) or once at the end.
         assistantHeaderAppendedRef.current = false;
-        assistantInCodeBlockRef.current = false;
         liveAssistantContentRef.current = '';
         lastFlushedLengthRef.current = 0;
         openFenceRef.current = null;
@@ -640,12 +660,9 @@ const ChatInterface: React.FC<{
         pendingRef.current = '';
 
         let assistantContent = '';
-        let assistantReasoning = '';
         const toolCalls: ToolCall[] = [];
         const toolAssembler: Map<number, ToolCall> = new Map();
-        // Fallback accumulator for servers that stream legacy function_call instead of tool_calls
-        let legacyFunctionCallName = '';
-        let legacyFunctionCallArgs = '';
+        // Harmony: expect modern tool_calls; no legacy function_call fallback
 
         // Process chunks with periodic yielding to keep UI responsive
         let lastYieldTime = Date.now();
@@ -670,7 +687,7 @@ const ChatInterface: React.FC<{
           return md;
         };
 
-        // Keep dynamic re-render size small by showing only the last N lines
+        // Keep dynamic re-render size small by showing only the last N lines (markdown mode)
         const clampPreview = (md: string, maxLines: number): string => {
           // If maxLines <= 0, show full live preview (no truncation)
           if (!Number.isFinite(maxLines) || maxLines <= 0) return balancedPreview(md);
@@ -679,6 +696,14 @@ const ChatInterface: React.FC<{
           const tail = lines.slice(-maxLines);
           const notice = '… [preview truncated; full text will appear when complete]\n';
           return balancedPreview(notice + tail.join('\n'));
+        };
+
+        // Raw clamp for preview: do not inject or strip anything; no notices.
+        const clampRaw = (text: string, maxLines: number): string => {
+          if (!Number.isFinite(maxLines) || maxLines <= 0) return text;
+          const lines = (text || '').split('\n');
+          if (lines.length <= maxLines) return text;
+          return lines.slice(-maxLines).join('\n');
         };
         // Prepare an append-only chunk with markdown fence continuity:
         // - If a code fence is open across chunks, prefix with the same fence to keep formatting.
@@ -730,13 +755,7 @@ const ChatInterface: React.FC<{
             }
           }
 
-          // Some OpenAI-compatible servers emit the older function_call field when using tools.
-          // Accumulate it and later translate into a single tool_call entry if no tool_calls were provided.
-          const legacy = (delta as any).function_call;
-          if (legacy) {
-            if (typeof legacy.name === 'string') legacyFunctionCallName += legacy.name;
-            if (typeof legacy.arguments === 'string') legacyFunctionCallArgs += legacy.arguments;
-          }
+          // Harmony alignment: ignore legacy function_call fields if present
 
           if (delta.content) {
             assistantContent += delta.content;
@@ -767,25 +786,48 @@ const ChatInterface: React.FC<{
                     const complete = p.slice(0, idx + 1);
                     const display = wrapChunkForDisplay(complete);
                     appendTranscript(<Box><MarkdownBlock content={display} /></Box>);
+                    lastBlockRef.current = 'assistant';
                     lastFlushedLengthRef.current += complete.length;
                     pendingRef.current = p.slice(idx + 1);
                     updateFenceStateFrom(complete);
                     p = pendingRef.current;
                   }
-                  // Show the current remainder live as markdown so the user sees
-                  // the entire response, including the last partial line.
+                  // Show raw pending remainder exactly as received (no markdown balancing).
                   if (p.length > 0) {
-                    const previewDisplay = wrapChunkForDisplay(p);
-                    setLivePreview(previewDisplay);
+                    setLivePreview(p);
                     setShowLivePreview(true);
                   } else {
-                    setShowLivePreview(false);
-                    setLivePreview('');
+                    // If no text remainder, but a tool call is being assembled, show its raw arguments.
+                    let toolRemainder = '';
+                    if (toolAssembler.size > 0) {
+                      const maxIndex = Math.max(...Array.from(toolAssembler.keys()));
+                      const tc = toolAssembler.get(maxIndex);
+                      if (tc?.function?.arguments) toolRemainder = tc.function.arguments;
+                    }
+                    // Harmony-only: no legacy function_call args fallback
+                    if ((toolRemainder || '').length > 0) {
+                      setLivePreview(toolRemainder);
+                      setShowLivePreview(true);
+                    } else {
+                      setShowLivePreview(false);
+                      setLivePreview('');
+                    }
                   }
                 } else {
-                  // In preview mode, show the full content live (balanced markdown)
-                  const previewDisplay = clampPreview(liveAssistantContentRef.current, previewMaxLines);
-                  setLivePreview(previewDisplay);
+                  // In preview mode, prefer raw content; if empty, show raw tool-call args
+                  const contentRaw = clampRaw(liveAssistantContentRef.current, previewMaxLines);
+                  let previewRaw = contentRaw;
+                  if (!previewRaw || previewRaw.length === 0) {
+                    let toolRemainder = '';
+                    if (toolAssembler.size > 0) {
+                      const maxIndex = Math.max(...Array.from(toolAssembler.keys()));
+                      const tc = toolAssembler.get(maxIndex);
+                      if (tc?.function?.arguments) toolRemainder = tc.function.arguments;
+                    }
+                    // Harmony-only: no legacy function_call args fallback
+                    previewRaw = clampRaw(toolRemainder, previewMaxLines);
+                  }
+                  setLivePreview(previewRaw || '');
                   setShowLivePreview(true);
                 }
                 lastFlushTime = now;
@@ -799,36 +841,11 @@ const ChatInterface: React.FC<{
               if (isInterruptedRef.current) break;
             }
           }
-          const rawReasoning: any = (delta as any).reasoning;
-          if (rawReasoning) {
-            let r = '';
-            if (typeof rawReasoning === 'string') {
-              r = rawReasoning;
-            } else if (Array.isArray(rawReasoning)) {
-              // Some servers may stream reasoning as an array of segments
-              r = rawReasoning.map((seg: any) => seg?.text ?? '').join('');
-            } else if (rawReasoning.content && Array.isArray(rawReasoning.content)) {
-              r = rawReasoning.content.map((seg: any) => seg?.text ?? '').join('');
-            }
-            if (r) {
-              assistantReasoning += r;
-              // We do not stream analysis live to the display; it's logged after turn ends
-            }
-          }
+          // Harmony: CoT appears as analysis channel inside content; no separate reasoning field
         }
 
         toolCalls.push(...Array.from(toolAssembler.values()));
-        // If no tool_calls were streamed but a legacy function_call was, convert it.
-        if (toolCalls.length === 0 && (legacyFunctionCallName || legacyFunctionCallArgs)) {
-          toolCalls.push({
-            id: `call_${Math.random().toString(36).slice(2, 10)}`,
-            type: 'function',
-            function: {
-              name: legacyFunctionCallName || 'unknown',
-              arguments: legacyFunctionCallArgs || '{}'
-            }
-          });
-        }
+        // Harmony: tool_calls assembled only from delta.tool_calls
         // toolCalls are assembled from delta.tool_calls only
         // Ensure each tool call has an id for tool message linking
         for (const tc of toolCalls) {
@@ -838,7 +855,8 @@ const ChatInterface: React.FC<{
         }
 
         // This is the message that will be sent back to the backend in the next turn.
-        // It must contain the RAW final content from the model (final channel tokens).
+        // Provide only the assistant text (no Harmony tags). If tool_calls are present,
+        // this text represents the analysis segment preceding the call.
         const finalOnly = assistantContent;
         // Build the assistant message for history/next turn.
         // Root-cause fix: if the model made tool calls and did NOT produce a final message,
@@ -850,11 +868,6 @@ const ChatInterface: React.FC<{
         }
         if (toolCalls.length > 0) {
           assistantMessage.tool_calls = toolCalls;
-          // Preserve analysis only for tool-call branches (not shown to the user)
-          if (!assistantMessage.content && assistantReasoning) {
-            accumulatedReasoning += assistantReasoning;
-            assistantMessage.thinking = accumulatedReasoning;
-          }
         }
 
         // End of stream; finalize display based on mode
@@ -864,6 +877,7 @@ const ChatInterface: React.FC<{
           if (remainder.length > 0) {
             const display = wrapChunkForDisplay(remainder);
             appendTranscript(<Box><MarkdownBlock content={display} /></Box>);
+            lastBlockRef.current = 'assistant';
             lastFlushedLengthRef.current += remainder.length;
             updateFenceStateFrom(remainder);
             pendingRef.current = '';
@@ -879,6 +893,7 @@ const ChatInterface: React.FC<{
               assistantHeaderAppendedRef.current = true;
             }
             appendTranscript(<Box><MarkdownBlock content={assistantContent} /></Box>);
+            lastBlockRef.current = 'assistant';
             setShowLivePreview(false);
             setLivePreview('');
             liveAssistantContentRef.current = '';
@@ -891,32 +906,13 @@ const ChatInterface: React.FC<{
         const assistantMessageForLlm: any = { role: 'assistant' };
         if (assistantMessage.content) assistantMessageForLlm.content = assistantMessage.content;
         if (assistantMessage.tool_calls) assistantMessageForLlm.tool_calls = assistantMessage.tool_calls;
-        // Per gpt-oss CoT guidance: include prior reasoning between tool calls
-        if (toolCalls.length > 0 && accumulatedReasoning && accumulatedReasoning.trim().length > 0) {
-          // OpenRouter-style reasoning field; include ALL analysis since last final
-          assistantMessageForLlm.reasoning = {
-            content: [
-              { type: 'reasoning_text', text: accumulatedReasoning }
-            ]
-          };
-        }
+        // Harmony: no extra reasoning field; prior analysis is already embedded in content
         messagesForLlm.push(assistantMessageForLlm);
 
         if (isInterruptedRef.current) break;
-        // Optionally show the assistant's analysis (chain-of-thought) if present
-        // This does not get sent back to the model; it's purely for user display.
-        if (showAnalysis && assistantReasoning && assistantReasoning.trim().length > 0) {
-          appendTranscript(
-            <Box flexDirection="column">
-              <Text color="magenta" bold>🧠 Analysis:</Text>
-              <Text>{assistantReasoning}</Text>
-            </Box>
-          );
-        }
+        // Do not render analysis separately; raw Harmony text already includes it
 
         if (toolCalls.length === 0) {
-          // Final answer produced; reset accumulated reasoning for next turn
-          accumulatedReasoning = '';
           break;
         }
 
@@ -976,6 +972,7 @@ const ChatInterface: React.FC<{
         } else {
           if (full.length > 0) {
             appendTranscript(<Box><MarkdownBlock content={full} /></Box>);
+            lastBlockRef.current = 'assistant';
           }
         }
         // Hide any live preview
@@ -1073,6 +1070,7 @@ const ChatInterface: React.FC<{
         <Text>{userInput}</Text>
       </Box>
     );
+    lastBlockRef.current = 'user';
     await processChatTurn(userInput);
   };
 
@@ -1106,7 +1104,7 @@ const ChatInterface: React.FC<{
 
       {isProcessing && showLivePreview && (
         <Box>
-          <MarkdownBlock content={livePreview} />
+          <Text>{livePreview}</Text>
         </Box>
       )}
 
@@ -1275,7 +1273,7 @@ const ApiKeyInput: React.FC<{ backendUrl: string; onAuthenticated: (sessionRespo
 };
 
 // Main App Component
-const App: React.FC<{ backendUrl: string; modelName: string; showAnalysis: boolean; streamChunks: boolean; streamIntervalMs: number; previewLines: number; streamMode: 'append' | 'preview' }> = ({ backendUrl, modelName, showAnalysis, streamChunks, streamIntervalMs, previewLines, streamMode }) => {
+const App: React.FC<{ backendUrl: string; modelName: string; streamChunks: boolean; streamIntervalMs: number; previewLines: number; streamMode: 'append' | 'preview' }> = ({ backendUrl, modelName, streamChunks, streamIntervalMs, previewLines, streamMode }) => {
   const [stage, setStage] = useState<'endpoint' | 'auth' | 'chat'>('endpoint');
   const [modelEndpoint, setModelEndpoint] = useState<string | null>(null);
   const [sessionData, setSessionData] = useState<SessionData | null>(null);
@@ -1323,7 +1321,6 @@ const App: React.FC<{ backendUrl: string; modelName: string; showAnalysis: boole
           modelEndpoint={modelEndpoint}
           modelName={modelName}
           initialRateLimitStatus={initialRateLimit}
-          showAnalysis={showAnalysis}
           streamChunks={streamChunks}
           streamIntervalMs={streamIntervalMs}
           streamMode={streamMode}
@@ -1346,7 +1343,6 @@ const cli = meow(`
   Options
     --backend, -b  Backend URL (default: https://frycli.share.zrok.io)
     --model, -m    Model name (default: gpt-4)
-    --show-analysis, -a  Show chain-of-thought (default: true)
     --stream, -s   Stream assistant output as tokens arrive (default: true)
     --stream-interval  Interval in ms for streaming chunks; set to 0 for flush-on-every-delta (default: 100)
     --preview-lines, -p  Max lines shown in live preview while streaming (0 = unlimited, default: 0)
@@ -1367,11 +1363,6 @@ const cli = meow(`
       type: 'string',
       shortFlag: 'm',
       default: 'gpt-4'
-    },
-    showAnalysis: {
-      type: 'boolean',
-      shortFlag: 'a',
-      default: true
     },
     stream: {
       type: 'boolean',
@@ -1409,7 +1400,6 @@ render(
   <App
     backendUrl={cli.flags.backend}
     modelName={cli.flags.model}
-    showAnalysis={Boolean(cli.flags.showAnalysis)}
     streamChunks={Boolean(cli.flags.stream)}
     streamIntervalMs={Number.isFinite(cli.flags.streamInterval) ? Number(cli.flags.streamInterval) : 0}
     previewLines={Number.isFinite(cli.flags.previewLines) ? Number(cli.flags.previewLines) : 0}
