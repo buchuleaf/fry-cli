@@ -393,6 +393,12 @@ const ChatInterface: React.FC<{
         </Text>
       </Box>
     );
+    // Show the working directory at the start of each chat
+    appendTranscript(
+      <Text dimColor>
+        Working directory: {process.cwd()}
+      </Text>
+    );
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -1021,6 +1027,12 @@ const ChatInterface: React.FC<{
                 {newSessionInfo.tier.toUpperCase()}
               </Text>
             </Box>
+          );
+          // Display working directory when a new session starts
+          appendTranscript(
+            <Text dimColor>
+              Working directory: {process.cwd()}
+            </Text>
           );
           appendTranscript(<Text color="yellow">History cleared. New session started.</Text>);
         } else {
