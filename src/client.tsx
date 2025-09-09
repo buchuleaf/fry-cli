@@ -720,7 +720,6 @@ const ChatInterface: React.FC<{
               if (!assistantHeaderAppendedRef.current) {
                 appendTranscript(<Box><Text color="green" bold>🤖 Fry:</Text></Box>);
                 assistantHeaderAppendedRef.current = true;
-                if (streamMode === 'preview') setShowLivePreview(true);
               }
               const interval = (streamIntervalMs ?? 0);
               const shouldUpdate = interval <= 0 || (now - lastFlushTime >= interval);
@@ -733,7 +732,7 @@ const ChatInterface: React.FC<{
                     consumedUpToRef.current = full.length;
                   }
                   const p = pendingRef.current;
-                  const idx = p.lastIndexOf('\n');
+                  const idx = Math.max(p.lastIndexOf('\n'), p.lastIndexOf('\r'));
                   if (idx >= 0) {
                     const complete = p.slice(0, idx + 1);
                     const display = wrapChunkForDisplay(complete);
@@ -742,8 +741,21 @@ const ChatInterface: React.FC<{
                     pendingRef.current = p.slice(idx + 1);
                     updateFenceStateFrom(complete);
                   }
+                  // Update tiny dynamic tail with current pending (no markdown)
+                  const tail = pendingRef.current || '';
+                  if (tail.length > 0) {
+                    // Limit to terminal width to avoid wrapping churn
+                    const max = Math.max(20, Math.min((process.stdout?.columns ?? 80), 120));
+                    const shown = tail.length > max ? tail.slice(-max) : tail;
+                    setLivePreview(shown);
+                    setShowLivePreview(true);
+                  } else {
+                    setShowLivePreview(false);
+                    setLivePreview('');
+                  }
                 } else {
                   setLivePreview(clampPreview(liveAssistantContentRef.current, previewMaxLines));
+                  setShowLivePreview(true);
                 }
                 lastFlushTime = now;
               }
@@ -1056,9 +1068,15 @@ const ChatInterface: React.FC<{
       </Box>
 
       {isProcessing && showLivePreview && (
-        <Box>
-          <MarkdownBlock content={livePreview} />
-        </Box>
+        streamMode === 'append' ? (
+          <Box>
+            <Text dimColor>{livePreview}</Text>
+          </Box>
+        ) : (
+          <Box>
+            <MarkdownBlock content={livePreview} />
+          </Box>
+        )
       )}
 
       {!isProcessing && (
