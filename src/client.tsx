@@ -750,7 +750,7 @@ const ChatInterface: React.FC<{
       </Static>
 
       {isProcessing && showLivePreview && (
-        <Box marginTop={headerCommittedRef.current ? 0 : 1}>
+        <Box> 
           {!headerCommittedRef.current && (
             <Text color="green" bold>🤖 Fry: </Text>
           )}

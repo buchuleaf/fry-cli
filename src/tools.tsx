@@ -440,11 +440,16 @@ export class LocalToolExecutor {
       }
       if (endLine > totalLines) endLine = totalLines;
 
-      const slice = allLines.slice(startLine - 1, endLine).join('\n');
+      const slice = allLines.slice(startLine - 1, endLine);
+      const numberedContent = slice.map((line, index) => {
+        const lineNumber = startLine + index;
+        return `${lineNumber}:${line}`;
+      }).join('\n');
+
       const hasMore = endLine < totalLines;
       const payload = {
         path: pathArg,
-        content: slice,
+        content: numberedContent,
         start_line: startLine,
         end_line: endLine,
         total_lines: totalLines,
