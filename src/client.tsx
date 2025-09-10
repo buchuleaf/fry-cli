@@ -418,11 +418,32 @@ const ChatInterface: React.FC<{
     }
 
     // Render result
-    let resultRaw: any = result?.data;
-    let resultText = typeof resultRaw === 'string' ? resultRaw : JSON.stringify(resultRaw, null, 2);
-    if (resultText === undefined || resultText === null) {
-      try { resultText = String(resultRaw ?? ''); } catch { resultText = ''; }
+    const resultRaw: any = result?.data;
+    let resultText: string;
+
+    // Special, readable formatting for successful file reads
+    if (
+      result.status === 'success' &&
+      typeof resultRaw === 'object' &&
+      resultRaw !== null &&
+      'path' in resultRaw &&
+      'content' in resultRaw &&
+      'start_line' in resultRaw &&
+      'end_line' in resultRaw &&
+      'total_lines' in resultRaw
+    ) {
+      const { path, content, start_line, end_line, total_lines, has_more } = resultRaw;
+      const header = `--- Reading ${path} (lines ${start_line}-${end_line} of ${total_lines}) ---`;
+      const footer = has_more ? `--- (more lines available) ---` : `--- (end of file) ---`;
+      resultText = [header, content, footer].join('\n');
+    } else {
+      // Default rendering for all other tools and error states
+      resultText = typeof resultRaw === 'string' ? resultRaw : JSON.stringify(resultRaw, null, 2);
+      if (resultText === undefined || resultText === null) {
+        try { resultText = String(resultRaw ?? ''); } catch { resultText = ''; }
+      }
     }
+    
     const indented = resultText.split('\n').map(l => `  ${l}`).join('\n');
     appendTranscript(
       <Box flexDirection="column" marginBottom={1}>
@@ -750,7 +771,7 @@ const ChatInterface: React.FC<{
       </Static>
 
       {isProcessing && showLivePreview && (
-        <Box> 
+        <Box marginTop={headerCommittedRef.current ? 0 : 1}>
           {!headerCommittedRef.current && (
             <Text color="green" bold>🤖 Fry: </Text>
           )}
