@@ -2,7 +2,6 @@
 // client.tsx
 import React, { useState, useEffect, useRef } from 'react';
 import { render, Text, Box, useInput, useApp, Static, useStdin, useFocus } from 'ink';
-import TextInput from 'ink-text-input';
 import Gradient from 'ink-gradient';
 import SelectInput from 'ink-select-input';
 import { OpenAI } from 'openai/index.mjs';
@@ -157,27 +156,18 @@ async function maybeSelfUpdate(opts?: { skip?: boolean, timeoutMs?: number }) {
 }
 
 // ===== Markdown renderer (terminal) =====
-try {
-  const width = Math.max(40, Math.min(process.stdout?.columns || 80, 120));
-  marked.use((markedTerminal as any)({
-    reflowText: false,
-    width,
-    tab: 2,
-    unescape: true
-  }));
-} catch {}
+marked.use(markedTerminal({
+  width: process.stdout.columns ? Math.min(process.stdout.columns, 120) : 80,
+  reflowText: true,
+  unescape: true,
+}));
+
+function stripHtmlTags(text: string): string {
+  return text.replace(/<[^>]*>/g, '');
+}
+
 const MarkdownBlock: React.FC<{ content: string }> = React.memo(({ content }) => {
-  const md = content ?? '';
-  let out = md;
-  try {
-    out = String(marked.parse(md));
-  } catch {
-    out = md;
-  }
-  const inputEndsWithNl = /\r?\n$/.test(md);
-  if (inputEndsWithNl) out = out.replace(/\n+$/g, '\n');
-  else out = out.replace(/\n+$/g, '');
-  return <Text>{out}</Text>;
+  return <Text>{content}</Text>;
 });
 
 // ===== Types =====
@@ -267,21 +257,24 @@ function balancedMarkdown(md: string): string {
   }
   return md;
 }
-// Extract the last final block (no tags)
-function extractHarmonyFinal(text: string): string {
-  if (typeof text !== 'string') return '';
-  const pattern = /<\|channel\|>final(?:\s+[a-zA-Z]+)?<\|message\|>/g;
-  let lastEnd = -1;
-  let m: RegExpExecArray | null;
-  while ((m = pattern.exec(text)) !== null) lastEnd = pattern.lastIndex;
-  if (lastEnd === -1) return text;
-  const endReturn = text.indexOf('<|return|>', lastEnd);
-  const endEnd = text.indexOf('<|end|>', lastEnd);
-  const candidates = [endReturn, endEnd].filter(i => i >= 0);
-  const end = candidates.length > 0 ? Math.min(...candidates) : text.length;
-  return text.slice(lastEnd, end);
+
+function cleanTextForDisplay(text: string): string {
+  if (!text) return '';
+  let cleaned = text;
+
+  cleaned = cleaned.replace(/<\|channel\|>(\w+)<\|message\|>/g, (match, channelName) => {
+    if (channelName.toLowerCase() === 'final') {
+      return '';
+    }
+    const title = channelName.charAt(0).toUpperCase() + channelName.slice(1);
+    return `\n**${title}:**\n`;
+  });
+
+  cleaned = cleaned.replace(/<\|(start|end|constrain|return|call|message|channel)\|>/g, '');
+  
+  return cleaned;
 }
-// Extract latest analysis before a tool call (no tags)
+
 function extractHarmonyAnalysis(text: string): string {
   if (typeof text !== 'string') return '';
   const callIdx = text.indexOf('<|call|>');
@@ -349,6 +342,13 @@ const ChatInterface: React.FC<{
   const pendingRef = useRef<string>('');
   const lastFlushedLengthRef = useRef<number>(0);
   const consumedUpToRef = useRef<number>(0);
+
+  // FIX: Restore this function to the correct scope.
+  const wrapChunkForDisplay = (rawChunk: string): string => {
+    const startFence = openFenceRef.current;
+    const prefix = startFence ? `${startFence}\n` : '';
+    return balancedMarkdown(prefix + rawChunk);
+  };
 
   useEffect(() => {
     appendTranscript(
@@ -421,23 +421,31 @@ const ChatInterface: React.FC<{
     const resultRaw: any = result?.data;
     let resultText: string;
 
-    // Special, readable formatting for successful file reads
     if (
       result.status === 'success' &&
       typeof resultRaw === 'object' &&
       resultRaw !== null &&
       'path' in resultRaw &&
-      'content' in resultRaw &&
-      'start_line' in resultRaw &&
-      'end_line' in resultRaw &&
-      'total_lines' in resultRaw
+      'content' in resultRaw
     ) {
       const { path, content, start_line, end_line, total_lines, has_more } = resultRaw;
       const header = `--- Reading ${path} (lines ${start_line}-${end_line} of ${total_lines}) ---`;
       const footer = has_more ? `--- (more lines available) ---` : `--- (end of file) ---`;
       resultText = [header, content, footer].join('\n');
+    } else if (
+      result.status === 'success' &&
+      toolName === 'fs.search_files' &&
+      Array.isArray(resultRaw)
+    ) {
+      const files = resultRaw as string[];
+      const header = `--- Found ${files.length} file(s) ---`;
+      if (files.length > 0) {
+        const fileList = files.map(f => `- ${f}`).join('\n');
+        resultText = [header, fileList].join('\n');
+      } else {
+        resultText = header;
+      }
     } else {
-      // Default rendering for all other tools and error states
       resultText = typeof resultRaw === 'string' ? resultRaw : JSON.stringify(resultRaw, null, 2);
       if (resultText === undefined || resultText === null) {
         try { resultText = String(resultRaw ?? ''); } catch { resultText = ''; }
@@ -452,6 +460,18 @@ const ChatInterface: React.FC<{
       </Box>
     );
     return result;
+  };
+
+  const parseAndAppend = async (rawContent: string) => {
+    const cleaned = cleanTextForDisplay(rawContent);
+    const wrapped = wrapChunkForDisplay(cleaned);
+    try {
+      const parsed = await marked.parse(wrapped);
+      const final = stripHtmlTags(parsed || '');
+      appendTranscript(<Box><MarkdownBlock content={final} /></Box>);
+    } catch {
+      appendTranscript(<Box><MarkdownBlock content={wrapped} /></Box>);
+    }
   };
 
   const processChatTurn = async (userInput: string) => {
@@ -512,11 +532,6 @@ const ChatInterface: React.FC<{
             }
           }
         };
-        const wrapChunkForDisplay = (rawChunk: string): string => {
-          const startFence = openFenceRef.current;
-          const prefix = startFence ? `${startFence}\n` : '';
-          return balancedMarkdown(prefix + rawChunk);
-        };
 
         for await (const chunk of stream) {
           if (isInterruptedRef.current) break;
@@ -557,12 +572,11 @@ const ChatInterface: React.FC<{
                 const idx = Math.max(p.lastIndexOf('\n'), p.lastIndexOf('\r'));
                 if (idx >= 0) {
                   const complete = p.slice(0, idx + 1);
-                  const disp = wrapChunkForDisplay(complete);
                   if (!headerCommittedRef.current) {
                     appendTranscript(<Box><Text color="green" bold>🤖 Fry:</Text></Box>);
                     headerCommittedRef.current = true;
                   }
-                  appendTranscript(<Box><MarkdownBlock content={disp} /></Box>);
+                  await parseAndAppend(complete);
                   lastBlockRef.current = 'assistant';
                   lastFlushedLengthRef.current += complete.length;
                   pendingRef.current = p.slice(idx + 1);
@@ -572,7 +586,7 @@ const ChatInterface: React.FC<{
                 if (p.length > 0) {
                   let disp = p;
                   if (lastFlushedLengthRef.current === 0) disp = disp.replace(/^(?:\r?\n)+/, '');
-                  setLivePreview(disp);
+                  setLivePreview(cleanTextForDisplay(disp));
                   setShowLivePreview(true);
                 } else {
                   setShowLivePreview(false);
@@ -599,12 +613,11 @@ const ChatInterface: React.FC<{
 
         const remainder = pendingRef.current;
         if (remainder.length > 0) {
-          const display = wrapChunkForDisplay(remainder);
           if (!headerCommittedRef.current) {
             appendTranscript(<Box><Text color="green" bold>🤖 Fry:</Text></Box>);
             headerCommittedRef.current = true;
           }
-          appendTranscript(<Box><MarkdownBlock content={display} /></Box>);
+          await parseAndAppend(remainder);
           lastBlockRef.current = 'assistant';
           pendingRef.current = '';
         }
@@ -613,12 +626,18 @@ const ChatInterface: React.FC<{
         setLivePreview('');
         liveAssistantContentRef.current = '';
 
-        const finalOnly = (toolCalls.length > 0)
-          ? extractHarmonyAnalysis(assistantContent)
-          : extractHarmonyFinal(assistantContent);
         const assistantMessage: Message = { role: 'assistant' };
-        if (finalOnly && finalOnly.trim().length > 0) assistantMessage.content = finalOnly;
-        if (toolCalls.length > 0) assistantMessage.tool_calls = toolCalls;
+        if (toolCalls.length > 0) {
+            const analysisContent = extractHarmonyAnalysis(assistantContent);
+            if (analysisContent && analysisContent.trim().length > 0) {
+                assistantMessage.content = analysisContent;
+            }
+            assistantMessage.tool_calls = toolCalls;
+        } else {
+            if (assistantContent && assistantContent.trim().length > 0) {
+                assistantMessage.content = assistantContent;
+            }
+        }
 
         turnMessages.current.push(assistantMessage);
         conversationHistory.current.push(assistantMessage);
@@ -650,12 +669,11 @@ const ChatInterface: React.FC<{
       if (isInterruptedRef.current) {
         const p = pendingRef.current;
         if (p.length > 0) {
-          const display = balancedMarkdown(p);
           if (!headerCommittedRef.current) {
             appendTranscript(<Box><Text color="green" bold>🤖 Fry:</Text></Box>);
             headerCommittedRef.current = true;
           }
-          appendTranscript(<Box><MarkdownBlock content={display} /></Box>);
+          await parseAndAppend(p);
         }
         setShowLivePreview(false);
         setLivePreview('');
@@ -789,8 +807,8 @@ const ChatInterface: React.FC<{
   
       <Box marginTop={1} justifyContent="space-between">
         <Box flexDirection="column">
-          <Text dimColor>Commands: /dashboard, /buy, /clear</Text>
-          <Text dimColor>Ctrl + C to interrupt</Text>
+          <Text dimColor>Shift+Enter for newline, Enter to submit</Text>
+          <Text dimColor>Commands: /dashboard, /buy, /clear, /exit</Text>
         </Box>
         {rateLimitStatus && (
           <Box flexDirection="column" alignItems="flex-end">
@@ -805,12 +823,42 @@ const ChatInterface: React.FC<{
   );
 };
 
-const ChatPrompt: React.FC<{ value: string; onChange: (v: string) => void; onSubmit: (v: string) => void }> = ({ value, onChange, onSubmit }) => {
-  const { isFocused } = useFocus({ autoFocus: true, isActive: true });
+const ChatPrompt: React.FC<{
+  value: string;
+  onChange: (v: string) => void;
+  onSubmit: (v: string) => void;
+}> = ({ value, onChange, onSubmit }) => {
+  const { isFocused } = useFocus({ autoFocus: true });
+
+  useInput(
+    (input, key) => {
+      if (key.return && !key.shift) {
+        if (value.trim()) {
+          onSubmit(value);
+        }
+        return;
+      }
+      if (key.return && key.shift) {
+        onChange(value + '\n');
+        return;
+      }
+      if (key.backspace) {
+        onChange(value.slice(0, -1));
+        return;
+      }
+      if (
+        !key.ctrl && !key.meta && key.return === false && key.backspace === false &&
+        !key.upArrow && !key.downArrow && !key.leftArrow && !key.rightArrow &&
+        key.tab === false && key.escape === false
+      ) {
+        onChange(value + input);
+      }
+    }, { isActive: isFocused });
+
   return (
     <Box>
       <Text color="blue" bold>👤 You: </Text>
-      <TextInput focus={isFocused} value={value} onChange={onChange} onSubmit={onSubmit} />
+      <Text>{value}</Text>
     </Box>
   );
 };
@@ -826,7 +874,6 @@ const EndpointSelector: React.FC<{ onSelect: (url: string) => void }> = ({ onSel
 
   const [showCustomInput, setShowCustomInput] = useState(false);
   const [customUrl, setCustomUrl] = useState('');
-  const { isFocused: urlInputFocused } = useFocus({ autoFocus: true, isActive: showCustomInput });
 
   const handleSelect = (item: any) => {
     if (item.value === 'custom') {
@@ -844,7 +891,7 @@ const EndpointSelector: React.FC<{ onSelect: (url: string) => void }> = ({ onSel
     return (
       <Box flexDirection="column">
         <Text color="cyan" bold>Enter custom endpoint URL:</Text>
-        <TextInput focus={urlInputFocused} value={customUrl} onChange={setCustomUrl} onSubmit={handleCustomSubmit} />
+        <ChatPrompt value={customUrl} onChange={setCustomUrl} onSubmit={handleCustomSubmit} />
       </Box>
     );
   }
@@ -883,7 +930,6 @@ const ApiKeyInput: React.FC<{ backendUrl: string; onAuthenticated: (sessionRespo
   const [apiKey, setApiKey] = useState('');
   const [isAuthenticating, setIsAuthenticating] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const { isFocused: apiKeyFocused } = useFocus({ autoFocus: true, isActive: true });
 
   useEffect(() => {
     const findAndAuthKey = async () => {
@@ -928,7 +974,7 @@ const ApiKeyInput: React.FC<{ backendUrl: string; onAuthenticated: (sessionRespo
       {error && <Text color="red">{error}</Text>}
       <Box marginTop={1}>
         <Text>Enter API key: </Text>
-        <TextInput focus={apiKeyFocused} value={apiKey} onChange={setApiKey} onSubmit={handleSubmit} />
+        <ChatPrompt value={apiKey} onChange={setApiKey} onSubmit={handleSubmit} />
       </Box>
     </Box>
   );
