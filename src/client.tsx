@@ -301,7 +301,8 @@ const ChatInterface: React.FC<{
   const [rateLimitStatus, setRateLimitStatus] = useState<RateLimitStatus | null>(initialRateLimitStatus);
   const isInterruptedRef = useRef(false);
 
-  // This state holds the raw markdown for the *current* streaming response
+  // Removed transient live preview; we now persist tokens directly.
+  // (kept placeholder state in case future UI needs it)
   const [streamingOutput, setStreamingOutput] = useState<string | null>(null);
 
   const localExecutor = useRef(new LocalToolExecutor());
@@ -429,7 +430,8 @@ const ChatInterface: React.FC<{
     isInterruptedRef.current = false;
     
     let accumulatedOutput = ''; // Accumulator for the current streamed assistant message
-    setStreamingOutput(''); // Show a live area during streaming only
+    // We no longer show a transient live area
+    setStreamingOutput(null);
 
     conversationHistory.current.push({ role: 'user', content: userInput });
     turnMessages.current = [{ role: 'user', content: userInput }];
@@ -450,7 +452,10 @@ const ChatInterface: React.FC<{
 
         // Reset accumulator for each assistant streaming cycle
         accumulatedOutput = '';
-        setStreamingOutput('');
+        setStreamingOutput(null);
+
+        // Track and update a single assistant transcript item for this cycle
+        let assistantIndex: number = -1;
 
         const builtinToolsKw = Array.from(new Set(
           (toolsForLlm || [])
@@ -490,19 +495,35 @@ const ChatInterface: React.FC<{
           }
 
           if (delta.content) {
-            accumulatedOutput += delta.content;
-            
-            // Throttle re-renders to prevent "yanking"
-            const now = Date.now();
-            if (now - lastRenderTime > streamIntervalMs) {
-              setStreamingOutput(accumulatedOutput);
-              lastRenderTime = now;
+            const renderAssistant = (content: string) => (
+              <Box>
+                <Text color="green" bold>🤖 Fry: </Text>
+                <StreamingMarkdown content={content} />
+              </Box>
+            );
+
+            if (assistantIndex === -1) {
+              // Create a new assistant item which we'll keep updating
+              setStaticItems(prev => {
+                const next = [...prev, renderAssistant('')];
+                assistantIndex = next.length - 1;
+                return next;
+              });
             }
+
+            accumulatedOutput += delta.content;
+            // Update the existing assistant item with new content
+            setStaticItems(prev => {
+              const next = [...prev];
+              const index = assistantIndex === -1 ? prev.length - 1 : assistantIndex;
+              next[index] = renderAssistant(accumulatedOutput);
+              return next;
+            });
+            lastRenderTime = Date.now();
           }
         }
 
-        // Ensure the final stream content is flushed to the live preview
-        setStreamingOutput(accumulatedOutput);
+        // No transient live flush; content already persisted token-by-token
 
         const assistantMessage: Message = { role: 'assistant' };
         if (accumulatedOutput.trim().length > 0) {
@@ -524,17 +545,7 @@ const ChatInterface: React.FC<{
         if (assistantMessage.tool_calls) assistantForLlm.tool_calls = assistantMessage.tool_calls;
         (messagesForLlm as any[]).push(assistantForLlm);
 
-        // Append the streamed assistant content to the transcript immediately so it persists
-        if ((assistantMessage.content || '').trim().length > 0) {
-          appendTranscript(
-            <Box>
-              <Text color="green" bold>🤖 Fry: </Text>
-              <StreamingMarkdown content={assistantMessage.content!} />
-            </Box>
-          );
-          // Remove the live streaming area once this chunk is finalized
-          setStreamingOutput(null);
-        }
+        // Do not append the full assistant content again; tokens already persisted
 
         if (isInterruptedRef.current) break;
 
@@ -572,31 +583,11 @@ const ChatInterface: React.FC<{
         }
       }
     } catch (error) {
-        // If there was any visible streamed content, finalize it so it doesn't disappear
-        if (streamingOutput && streamingOutput.length > 0) {
-          appendTranscript(
-            <Box>
-              <Text color="green" bold>🤖 Fry: </Text>
-              <StreamingMarkdown content={streamingOutput} streaming={true} />
-            </Box>
-          );
-          setStreamingOutput(null);
-        }
         appendTranscript(<Text color="red">Error: {String(error)}</Text>);
     }
     // This finally block ensures the UI is always cleaned up correctly.
     finally {
       if (isInterruptedRef.current) {
-        // Finalize any partial streamed content so it persists in history
-        if (streamingOutput && streamingOutput.length > 0) {
-          appendTranscript(
-            <Box>
-              <Text color="green" bold>🤖 Fry: </Text>
-              <StreamingMarkdown content={streamingOutput} streaming={true} />
-            </Box>
-          );
-          setStreamingOutput(null);
-        }
         appendTranscript(<Text color="yellow">✗ Response interrupted by user.</Text>);
       }
 
@@ -731,17 +722,13 @@ const ChatInterface: React.FC<{
 
   return (
     <Box flexDirection="column">
-      <Static items={staticItems}>
-        {(item, idx) => <Box key={idx}>{item}</Box>}
-      </Static>
+      <Box flexDirection="column">
+        {staticItems.map((item, idx) => (
+          <Box key={idx}>{item}</Box>
+        ))}
+      </Box>
 
-      {/* This component renders the live, streaming response */}
-      {streamingOutput !== null && (
-        <Box>
-          <Text color="green" bold>🤖 Fry: </Text>
-          <StreamingMarkdown content={streamingOutput} streaming={true} />
-        </Box>
-      )}
+      {/* Live streaming area removed; tokens are persisted directly */}
 
       {!isProcessing && (
         <ChatPrompt
