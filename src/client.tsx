@@ -251,33 +251,24 @@ const LoadingIndicator: React.FC<{ text: string }> = ({ text }) => (
   <Box><Text color="cyan">{text}</Text></Box>
 );
 
-// This component handles the async parsing of markdown for live streaming.
-const StreamingMarkdown: React.FC<{ content: string }> = ({ content }) => {
-  const [renderedContent, setRenderedContent] = useState('');
-
-  useEffect(() => {
-    (async () => {
-      if (content) {
-        try {
-          // Buffer for robust code block rendering. If an odd number of ``` fences
-          // exists, it means a code block is open. We temporarily add a closing
-          // fence to make the markdown renderer behave correctly during streaming.
-          const fences = content.match(/```/g) || [];
-          const isCodeBlockOpen = fences.length % 2 !== 0;
-          const bufferedContent = isCodeBlockOpen ? content + '\n```' : content;
-
-          const parsed = await Promise.resolve(marked(bufferedContent));
-          setRenderedContent(parsed);
-        } catch (e) {
-          setRenderedContent(content); // Fallback to raw content on error
-        }
-      } else {
-        setRenderedContent('');
-      }
-    })();
-  }, [content]); // Re-run whenever the raw content string changes
-
-  return <Text>{renderedContent}</Text>;
+// Synchronous Markdown renderer designed to work both for live streaming
+// (optionally buffers unclosed code fences) and finalized transcript items.
+const StreamingMarkdown: React.FC<{ content: string; streaming?: boolean }> = ({ content, streaming }) => {
+  // Compute synchronously so content persists when flushed by <Static />.
+  let toRender = content || '';
+  try {
+    if (streaming && toRender) {
+      // If there's an odd number of ``` fences, temporarily close the block
+      // to avoid broken formatting during streaming.
+      const fences = toRender.match(/```/g) || [];
+      const isCodeBlockOpen = fences.length % 2 !== 0;
+      if (isCodeBlockOpen) toRender = toRender + '\n```';
+    }
+    toRender = marked(toRender) as unknown as string;
+  } catch {
+    // Fallback to raw content on parsing error
+  }
+  return <Text>{toRender}</Text>;
 };
 
 // ===== Chat Component =====
@@ -388,9 +379,16 @@ const ChatInterface: React.FC<{
       }
     }
 
-    // Render result
+    // Render result and also normalize what we send back to the model.
     const resultRaw: any = result?.data;
     let resultText: string;
+
+    // Detect a generic pagination envelope: { content: string, page, total_pages, ... }
+    const isPaginated = (
+      result && result.status === 'success' &&
+      resultRaw && typeof resultRaw === 'object' && typeof (resultRaw as any).content === 'string' &&
+      Number.isFinite((resultRaw as any).page) && Number.isFinite((resultRaw as any).total_pages)
+    );
 
     if (
       result.status === 'success' &&
@@ -399,24 +397,17 @@ const ChatInterface: React.FC<{
       'path' in resultRaw &&
       'content' in resultRaw
     ) {
+      // File read (line-ranged) formatting
       const { path, content, start_line, end_line, total_lines, has_more } = resultRaw as any;
       const header = `--- Reading ${path} (lines ${start_line}-${end_line} of ${total_lines}) ---`;
       const footer = has_more ? `--- (more lines available) ---` : `--- (end of file) ---`;
       resultText = [header, content, footer].join('\n');
-    } else if (
-      result.status === 'success' &&
-      toolName === 'fs.search_files' &&
-      Array.isArray(resultRaw)
-    ) {
-      const files = resultRaw as string[];
-      const header = `--- Found ${files.length} file(s) ---`;
-      if (files.length > 0) {
-        const fileList = files.map(f => `- ${f}`).join('\n');
-        resultText = [header, fileList].join('\n');
-      } else {
-        resultText = header;
-      }
+    } else if (isPaginated) {
+      const { page, total_pages, page_size, total_chars } = resultRaw as any;
+      const header = `--- Page ${page}/${total_pages} (page_size=${page_size}, total_chars=${total_chars}) ---`;
+      resultText = [header, (resultRaw as any).content].join('\n');
     } else {
+      // Fallback formatting
       resultText = typeof resultRaw === 'string' ? resultRaw : JSON.stringify(resultRaw, null, 2);
       if (resultText === undefined || resultText === null) {
         try { resultText = String(resultRaw ?? ''); } catch { resultText = ''; }
@@ -437,8 +428,8 @@ const ChatInterface: React.FC<{
     setIsProcessing(true);
     isInterruptedRef.current = false;
     
-    let accumulatedOutput = ''; // Local accumulator for the full response
-    setStreamingOutput(''); // Start the stream by showing the empty streaming component
+    let accumulatedOutput = ''; // Accumulator for the current streamed assistant message
+    setStreamingOutput(''); // Show a live area during streaming only
 
     conversationHistory.current.push({ role: 'user', content: userInput });
     turnMessages.current = [{ role: 'user', content: userInput }];
@@ -456,6 +447,10 @@ const ChatInterface: React.FC<{
       // === Stream assistant ===
       while (true) {
         if (isInterruptedRef.current) break;
+
+        // Reset accumulator for each assistant streaming cycle
+        accumulatedOutput = '';
+        setStreamingOutput('');
 
         const builtinToolsKw = Array.from(new Set(
           (toolsForLlm || [])
@@ -529,17 +524,47 @@ const ChatInterface: React.FC<{
         if (assistantMessage.tool_calls) assistantForLlm.tool_calls = assistantMessage.tool_calls;
         (messagesForLlm as any[]).push(assistantForLlm);
 
+        // Append the streamed assistant content to the transcript immediately so it persists
+        if ((assistantMessage.content || '').trim().length > 0) {
+          appendTranscript(
+            <Box>
+              <Text color="green" bold>🤖 Fry: </Text>
+              <StreamingMarkdown content={assistantMessage.content!} />
+            </Box>
+          );
+          // Remove the live streaming area once this chunk is finalized
+          setStreamingOutput(null);
+        }
+
         if (isInterruptedRef.current) break;
 
         if ((assistantMessage.tool_calls?.length || 0) === 0) break;
 
         for (const toolCall of assistantMessage.tool_calls || []) {
-          const result = await executeToolCall(toolCall);
+        const result = await executeToolCall(toolCall);
+          // Normalize pagination for the model: send the page content as data, with meta sidecar
+          const rawData: any = result?.data;
+          const looksPaginated = rawData && typeof rawData === 'object' && typeof rawData.content === 'string' && Number.isFinite(rawData.page) && Number.isFinite(rawData.total_pages);
+          const payloadForModel = looksPaginated
+            ? {
+                status: result.status,
+                data: rawData.content,
+                pagination: {
+                  page: rawData.page,
+                  page_size: rawData.page_size,
+                  total_chars: rawData.total_chars,
+                  total_pages: rawData.total_pages,
+                  has_prev: rawData.has_prev,
+                  has_next: rawData.has_next,
+                },
+                tool: toolCall.function.name,
+              }
+            : result;
           const toolMessage: Message = {
             role: 'tool',
             tool_call_id: toolCall.id,
             name: toolCall.function.name,
-            content: JSON.stringify(result)
+            content: JSON.stringify(payloadForModel)
           };
           turnMessages.current.push(toolMessage);
           (messagesForLlm as any[]).push(toolMessage);
@@ -547,16 +572,34 @@ const ChatInterface: React.FC<{
         }
       }
     } catch (error) {
+        // If there was any visible streamed content, finalize it so it doesn't disappear
+        if (streamingOutput && streamingOutput.length > 0) {
+          appendTranscript(
+            <Box>
+              <Text color="green" bold>🤖 Fry: </Text>
+              <StreamingMarkdown content={streamingOutput} streaming={true} />
+            </Box>
+          );
+          setStreamingOutput(null);
+        }
         appendTranscript(<Text color="red">Error: {String(error)}</Text>);
     }
     // This finally block ensures the UI is always cleaned up correctly.
     finally {
       if (isInterruptedRef.current) {
+        // Finalize any partial streamed content so it persists in history
+        if (streamingOutput && streamingOutput.length > 0) {
+          appendTranscript(
+            <Box>
+              <Text color="green" bold>🤖 Fry: </Text>
+              <StreamingMarkdown content={streamingOutput} streaming={true} />
+            </Box>
+          );
+          setStreamingOutput(null);
+        }
         appendTranscript(<Text color="yellow">✗ Response interrupted by user.</Text>);
       }
 
-      // Do not append a duplicate of the model response; keep the streamed output visible.
-      // The previous streamed response will be finalized (moved to static) when the next turn starts.
       setIsProcessing(false);
     }
   };
@@ -567,16 +610,6 @@ const ChatInterface: React.FC<{
     const userInput = value.trim();
     setInput('');
     
-    // If there's a previous streamed response still visible, finalize it into the transcript
-    if (streamingOutput && streamingOutput.length > 0) {
-      appendTranscript(
-        <Box>
-          <Text color="green" bold>🤖 Fry: </Text>
-          <StreamingMarkdown content={streamingOutput} />
-        </Box>
-      );
-      setStreamingOutput(null);
-    }
 
     if (userInput.toLowerCase() === 'exit' || userInput.toLowerCase() === 'quit') {
       exit();
@@ -706,7 +739,7 @@ const ChatInterface: React.FC<{
       {streamingOutput !== null && (
         <Box>
           <Text color="green" bold>🤖 Fry: </Text>
-          <StreamingMarkdown content={streamingOutput} />
+          <StreamingMarkdown content={streamingOutput} streaming={true} />
         </Box>
       )}
 
