@@ -155,8 +155,9 @@ async function maybeSelfUpdate(opts?: { skip?: boolean, timeoutMs?: number }) {
 
 // ===== Markdown renderer (terminal) =====
 marked.use(markedTerminal({
-  width: process.stdout.columns ? Math.min(process.stdout.columns, 120) : 80,
-  reflowText: true,
+  // Preserve model formatting as much as possible: avoid reflowing/wrapping text.
+  width: process.stdout.columns || 80,
+  reflowText: false,
   unescape: true,
   breaks: true,
 }));
@@ -477,7 +478,7 @@ const ChatInterface: React.FC<{
         for await (const chunk of stream as AsyncIterable<StreamChunk>) {
           if (isInterruptedRef.current) break;
 
-          const delta = chunk.choices?.?.delta;
+          const delta = chunk.choices?.[0]?.delta;
           if (!delta) continue;
 
           // Assemble tool_calls
@@ -504,6 +505,9 @@ const ChatInterface: React.FC<{
             }
           }
         }
+
+        // Ensure the final stream content is flushed to the live preview
+        setStreamingOutput(accumulatedOutput);
 
         const assistantMessage: Message = { role: 'assistant' };
         if (accumulatedOutput.trim().length > 0) {
@@ -551,19 +555,8 @@ const ChatInterface: React.FC<{
         appendTranscript(<Text color="yellow">✗ Response interrupted by user.</Text>);
       }
 
-      // Commit the final, fully rendered message to the static transcript.
-      if (accumulatedOutput) {
-        const finalComponent = (
-          <Box>
-            <Text color="green" bold>🤖 Fry: </Text>
-            <StreamingMarkdown content={accumulatedOutput} />
-          </Box>
-        );
-        appendTranscript(finalComponent);
-      }
-
-      // Hide the streaming component and finish the turn.
-      setStreamingOutput(null);
+      // Do not append a duplicate of the model response; keep the streamed output visible.
+      // The previous streamed response will be finalized (moved to static) when the next turn starts.
       setIsProcessing(false);
     }
   };
@@ -574,6 +567,17 @@ const ChatInterface: React.FC<{
     const userInput = value.trim();
     setInput('');
     
+    // If there's a previous streamed response still visible, finalize it into the transcript
+    if (streamingOutput && streamingOutput.length > 0) {
+      appendTranscript(
+        <Box>
+          <Text color="green" bold>🤖 Fry: </Text>
+          <StreamingMarkdown content={streamingOutput} />
+        </Box>
+      );
+      setStreamingOutput(null);
+    }
+
     if (userInput.toLowerCase() === 'exit' || userInput.toLowerCase() === 'quit') {
       exit();
       return;
@@ -585,6 +589,9 @@ const ChatInterface: React.FC<{
         isInterruptedRef.current = false;
         turnMessages.current = [];
         conversationHistory.current = [];
+
+        // Clear any visible streamed response when clearing history
+        setStreamingOutput(null);
 
         const newSession = await client.startSession();
         if (newSession) {
@@ -836,7 +843,7 @@ const loadApiKeyFromEnv = async (): Promise<string | null> => {
   try {
     const content = await fs.readFile(ENV_PATH, 'utf-8');
     const match = content.match(/^GPT_OSS_API_KEY=(.*)$/m);
-    return match && typeof match === 'string' ? match.trim() : null;
+    return match ? match[1].trim() : null;
   } catch (error) {
     return null;
   }
