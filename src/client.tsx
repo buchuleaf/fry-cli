@@ -21,8 +21,6 @@ import { readFile } from 'fs/promises';
 import { marked } from 'marked';
 import { markedTerminal } from 'marked-terminal';
 
-const SHOW_ANALYSIS_BLOCK = true;
-
 // ===== Helpers: directory listing (workspace snapshot) =====
 async function getRootDirectoryListing(maxChars: number = 4000): Promise<string> {
   try {
@@ -160,15 +158,8 @@ marked.use(markedTerminal({
   width: process.stdout.columns ? Math.min(process.stdout.columns, 120) : 80,
   reflowText: true,
   unescape: true,
+  breaks: true,
 }));
-
-function stripHtmlTags(text: string): string {
-  return text.replace(/<[^>]*>/g, '');
-}
-
-const MarkdownBlock: React.FC<{ content: string }> = React.memo(({ content }) => {
-  return <Text>{content}</Text>;
-});
 
 // ===== Types =====
 interface SessionData { session_id: string; tier: 'free' | 'premium'; }
@@ -180,6 +171,25 @@ interface Message {
   tool_call_id?: string;
   name?: string;
 }
+
+// Streaming delta (loosely typed to match OpenAI-compatible chunks)
+type ToolDelta = {
+  index: number;
+  id?: string;
+  function?: {
+    name?: string;
+    arguments?: string;
+  }
+};
+type ChoiceDelta = {
+  delta?: {
+    content?: string;
+    tool_calls?: ToolDelta[];
+  }
+};
+type StreamChunk = {
+  choices?: ChoiceDelta[];
+};
 
 // ===== API Client =====
 class GptOssApiClient {
@@ -240,59 +250,34 @@ const LoadingIndicator: React.FC<{ text: string }> = ({ text }) => (
   <Box><Text color="cyan">{text}</Text></Box>
 );
 
-// ===== Harmony helpers =====
-function balancedMarkdown(md: string): string {
-  let marker: '```' | '~~~' | null = null;
-  const lines = (md || '').split('\n');
-  for (const line of lines) {
-    const m = line.match(/^\s*(```|~~~)/);
-    if (m) {
-      const cur = m[1] as '```' | '~~~';
-      if (!marker) marker = cur; else if (marker === cur) marker = null;
-    }
-  }
-  if (marker) {
-    if (!md.endsWith('\n')) md += '\n';
-    md += marker;
-  }
-  return md;
-}
+// This component handles the async parsing of markdown for live streaming.
+const StreamingMarkdown: React.FC<{ content: string }> = ({ content }) => {
+  const [renderedContent, setRenderedContent] = useState('');
 
-function cleanTextForDisplay(text: string): string {
-  if (!text) return '';
-  let cleaned = text;
+  useEffect(() => {
+    (async () => {
+      if (content) {
+        try {
+          // Buffer for robust code block rendering. If an odd number of ``` fences
+          // exists, it means a code block is open. We temporarily add a closing
+          // fence to make the markdown renderer behave correctly during streaming.
+          const fences = content.match(/```/g) || [];
+          const isCodeBlockOpen = fences.length % 2 !== 0;
+          const bufferedContent = isCodeBlockOpen ? content + '\n```' : content;
 
-  cleaned = cleaned.replace(/<\|channel\|>(\w+)<\|message\|>/g, (match, channelName) => {
-    if (channelName.toLowerCase() === 'final') {
-      return '';
-    }
-    const title = channelName.charAt(0).toUpperCase() + channelName.slice(1);
-    return `\n**${title}:**\n`;
-  });
+          const parsed = await Promise.resolve(marked(bufferedContent));
+          setRenderedContent(parsed);
+        } catch (e) {
+          setRenderedContent(content); // Fallback to raw content on error
+        }
+      } else {
+        setRenderedContent('');
+      }
+    })();
+  }, [content]); // Re-run whenever the raw content string changes
 
-  cleaned = cleaned.replace(/<\|(start|end|constrain|return|call|message|channel)\|>/g, '');
-  
-  return cleaned;
-}
-
-function extractHarmonyAnalysis(text: string): string {
-  if (typeof text !== 'string') return '';
-  const callIdx = text.indexOf('<|call|>');
-  const searchEnd = callIdx >= 0 ? callIdx : text.length;
-  const pattern = /<\|channel\|>analysis(?:\s+[a-zA-Z]+)?<\|message\|>/g;
-  let lastHeaderEnd = -1;
-  let m: RegExpExecArray | null;
-  while ((m = pattern.exec(text)) !== null) {
-    if (pattern.lastIndex <= searchEnd) lastHeaderEnd = pattern.lastIndex; else break;
-  }
-  if (lastHeaderEnd === -1) {
-    const raw = text.slice(0, searchEnd);
-    return raw.replaceAll('<|start|>', '').replaceAll('<|end|>', '').replaceAll('<|message|>', '');
-  }
-  const endIdx = text.indexOf('<|end|>', lastHeaderEnd);
-  const sliceEnd = (endIdx >= 0 && endIdx <= searchEnd) ? endIdx : searchEnd;
-  return text.slice(lastHeaderEnd, sliceEnd);
-}
+  return <Text>{renderedContent}</Text>;
+};
 
 // ===== Chat Component =====
 type TranscriptItem = React.ReactNode;
@@ -313,7 +298,6 @@ const ChatInterface: React.FC<{
   modelName,
   initialRateLimitStatus,
   onResetSession,
-  streamChunks,
   streamIntervalMs,
 }) => {
   const { exit } = useApp();
@@ -325,6 +309,9 @@ const ChatInterface: React.FC<{
   const [rateLimitStatus, setRateLimitStatus] = useState<RateLimitStatus | null>(initialRateLimitStatus);
   const isInterruptedRef = useRef(false);
 
+  // This state holds the raw markdown for the *current* streaming response
+  const [streamingOutput, setStreamingOutput] = useState<string | null>(null);
+
   const localExecutor = useRef(new LocalToolExecutor());
   const openaiClient = useRef(new OpenAI({ baseURL: modelEndpoint, apiKey: 'dummy' }));
   const conversationHistory = useRef<Message[]>([]);
@@ -332,23 +319,6 @@ const ChatInterface: React.FC<{
 
   const appendTranscript = (node: TranscriptItem) => setStaticItems(prev => [...prev, node]);
   const lastBlockRef = useRef<'assistant' | 'tool' | 'user' | 'system' | 'other' | null>(null);
-
-  // Live preview state
-  const [livePreview, setLivePreview] = useState<string>('');
-  const [showLivePreview, setShowLivePreview] = useState<boolean>(false);
-  const liveAssistantContentRef = useRef<string>('');
-  const openFenceRef = useRef<'```' | '~~~' | null>(null);
-  const headerCommittedRef = useRef<boolean>(false);
-  const pendingRef = useRef<string>('');
-  const lastFlushedLengthRef = useRef<number>(0);
-  const consumedUpToRef = useRef<number>(0);
-
-  // FIX: Restore this function to the correct scope.
-  const wrapChunkForDisplay = (rawChunk: string): string => {
-    const startFence = openFenceRef.current;
-    const prefix = startFence ? `${startFence}\n` : '';
-    return balancedMarkdown(prefix + rawChunk);
-  };
 
   useEffect(() => {
     appendTranscript(
@@ -389,7 +359,7 @@ const ChatInterface: React.FC<{
         .join(', ');
     } catch {}
     appendTranscript(
-      <Box marginTop={lastBlockRef.current === 'assistant' ? 1 : 0}>
+      <Box>
         <Text color="yellow">🔧 Executing: </Text>
         <Text color="cyan" bold>{toolName}({argsStr})</Text>
       </Box>
@@ -428,7 +398,7 @@ const ChatInterface: React.FC<{
       'path' in resultRaw &&
       'content' in resultRaw
     ) {
-      const { path, content, start_line, end_line, total_lines, has_more } = resultRaw;
+      const { path, content, start_line, end_line, total_lines, has_more } = resultRaw as any;
       const header = `--- Reading ${path} (lines ${start_line}-${end_line} of ${total_lines}) ---`;
       const footer = has_more ? `--- (more lines available) ---` : `--- (end of file) ---`;
       resultText = [header, content, footer].join('\n');
@@ -462,30 +432,24 @@ const ChatInterface: React.FC<{
     return result;
   };
 
-  const parseAndAppend = async (rawContent: string) => {
-    const cleaned = cleanTextForDisplay(rawContent);
-    const wrapped = wrapChunkForDisplay(cleaned);
-    try {
-      const parsed = await marked.parse(wrapped);
-      const final = stripHtmlTags(parsed || '');
-      appendTranscript(<Box><MarkdownBlock content={final} /></Box>);
-    } catch {
-      appendTranscript(<Box><MarkdownBlock content={wrapped} /></Box>);
-    }
-  };
-
   const processChatTurn = async (userInput: string) => {
     setIsProcessing(true);
     isInterruptedRef.current = false;
+    
+    let accumulatedOutput = ''; // Local accumulator for the full response
+    setStreamingOutput(''); // Start the stream by showing the empty streaming component
+
     conversationHistory.current.push({ role: 'user', content: userInput });
     turnMessages.current = [{ role: 'user', content: userInput }];
 
-    try {
+    let lastRenderTime = Date.now();
+
+    try { // Wrap main logic in try/finally to ensure cleanup
       const rootListing = await getRootDirectoryListing();
       await client.sendWorkspaceContents(sessionData.session_id, rootListing);
 
       const backendData = await client.prepareChatTurn(sessionData.session_id, conversationHistory.current);
-      const messagesForLlm = backendData.messages || [];
+      const messagesForLlm: any[] = backendData.messages || [];
       const toolsForLlm = backendData.tools || [];
 
       // === Stream assistant ===
@@ -507,36 +471,13 @@ const ChatInterface: React.FC<{
           extra_body: { add_generation_prompt: true, builtin_tools: builtinToolsKw }
         });
 
-        // Reset per-turn streaming state
-        liveAssistantContentRef.current = '';
-        openFenceRef.current = null;
-        headerCommittedRef.current = false;
-        pendingRef.current = '';
-        lastFlushedLengthRef.current = 0;
-        consumedUpToRef.current = 0;
-
-        let assistantContent = '';
         const toolAssembler: Map<number, ToolCall> = new Map();
         const toolCalls: ToolCall[] = [];
-        let lastFlushTime = 0;
-        let lastYieldTime = Date.now();
 
-        const updateFenceStateFrom = (rawChunk: string) => {
-          const lines = (rawChunk || '').split('\n');
-          for (const line of lines) {
-            const m = line.match(/^\s*(```|~~~)/);
-            if (m) {
-              const cur = m[1] as '```' | '~~~';
-              if (!openFenceRef.current) openFenceRef.current = cur;
-              else if (openFenceRef.current === cur) openFenceRef.current = null;
-            }
-          }
-        };
-
-        for await (const chunk of stream) {
+        for await (const chunk of stream as AsyncIterable<StreamChunk>) {
           if (isInterruptedRef.current) break;
 
-          const delta = chunk.choices?.[0]?.delta;
+          const delta = chunk.choices?.?.delta;
           if (!delta) continue;
 
           // Assemble tool_calls
@@ -553,90 +494,28 @@ const ChatInterface: React.FC<{
           }
 
           if (delta.content) {
-            assistantContent += delta.content;
-            const updated = liveAssistantContentRef.current + delta.content;
-            liveAssistantContentRef.current = updated;
-
-            if (streamChunks) {
-              const now = Date.now();
-              const shouldUpdate = (streamIntervalMs ?? 0) <= 0 || (now - lastFlushTime >= streamIntervalMs);
-              if (shouldUpdate) {
-                const full = liveAssistantContentRef.current;
-                const consumed = consumedUpToRef.current;
-                if (full.length > consumed) {
-                  pendingRef.current += full.slice(consumed);
-                  consumedUpToRef.current = full.length;
-                }
-                let p = pendingRef.current;
-
-                const idx = Math.max(p.lastIndexOf('\n'), p.lastIndexOf('\r'));
-                if (idx >= 0) {
-                  const complete = p.slice(0, idx + 1);
-                  if (!headerCommittedRef.current) {
-                    appendTranscript(<Box><Text color="green" bold>🤖 Fry:</Text></Box>);
-                    headerCommittedRef.current = true;
-                  }
-                  await parseAndAppend(complete);
-                  lastBlockRef.current = 'assistant';
-                  lastFlushedLengthRef.current += complete.length;
-                  pendingRef.current = p.slice(idx + 1);
-                  updateFenceStateFrom(complete);
-                  p = pendingRef.current;
-                }
-                if (p.length > 0) {
-                  let disp = p;
-                  if (lastFlushedLengthRef.current === 0) disp = disp.replace(/^(?:\r?\n)+/, '');
-                  setLivePreview(cleanTextForDisplay(disp));
-                  setShowLivePreview(true);
-                } else {
-                  setShowLivePreview(false);
-                  setLivePreview('');
-                }
-                lastFlushTime = now;
-              }
-            }
-
+            accumulatedOutput += delta.content;
+            
+            // Throttle re-renders to prevent "yanking"
             const now = Date.now();
-            if (now - lastYieldTime > 50) {
-              await new Promise(resolve => setImmediate(resolve));
-              lastYieldTime = now;
-              if (isInterruptedRef.current) break;
+            if (now - lastRenderTime > streamIntervalMs) {
+              setStreamingOutput(accumulatedOutput);
+              lastRenderTime = now;
             }
           }
+        }
+
+        const assistantMessage: Message = { role: 'assistant' };
+        if (accumulatedOutput.trim().length > 0) {
+          assistantMessage.content = accumulatedOutput;
         }
 
         toolCalls.push(...Array.from(toolAssembler.values()));
         for (const tc of toolCalls) {
           if (!tc.id || tc.id.length === 0) tc.id = `call_${Math.random().toString(36).slice(2, 10)}`;
         }
-        if (toolCalls.length > 1) toolCalls.splice(1);
-
-        const remainder = pendingRef.current;
-        if (remainder.length > 0) {
-          if (!headerCommittedRef.current) {
-            appendTranscript(<Box><Text color="green" bold>🤖 Fry:</Text></Box>);
-            headerCommittedRef.current = true;
-          }
-          await parseAndAppend(remainder);
-          lastBlockRef.current = 'assistant';
-          pendingRef.current = '';
-        }
-
-        setShowLivePreview(false);
-        setLivePreview('');
-        liveAssistantContentRef.current = '';
-
-        const assistantMessage: Message = { role: 'assistant' };
         if (toolCalls.length > 0) {
-            const analysisContent = extractHarmonyAnalysis(assistantContent);
-            if (analysisContent && analysisContent.trim().length > 0) {
-                assistantMessage.content = analysisContent;
-            }
-            assistantMessage.tool_calls = toolCalls;
-        } else {
-            if (assistantContent && assistantContent.trim().length > 0) {
-                assistantMessage.content = assistantContent;
-            }
+          assistantMessage.tool_calls = toolCalls.slice(0, 1);
         }
 
         turnMessages.current.push(assistantMessage);
@@ -648,9 +527,9 @@ const ChatInterface: React.FC<{
 
         if (isInterruptedRef.current) break;
 
-        if (toolCalls.length === 0) break;
+        if ((assistantMessage.tool_calls?.length || 0) === 0) break;
 
-        for (const toolCall of toolCalls) {
+        for (const toolCall of assistantMessage.tool_calls || []) {
           const result = await executeToolCall(toolCall);
           const toolMessage: Message = {
             role: 'tool',
@@ -664,22 +543,27 @@ const ChatInterface: React.FC<{
         }
       }
     } catch (error) {
-      appendTranscript(<Text color="red">Error: {String(error)}</Text>);
-    } finally {
+        appendTranscript(<Text color="red">Error: {String(error)}</Text>);
+    }
+    // This finally block ensures the UI is always cleaned up correctly.
+    finally {
       if (isInterruptedRef.current) {
-        const p = pendingRef.current;
-        if (p.length > 0) {
-          if (!headerCommittedRef.current) {
-            appendTranscript(<Box><Text color="green" bold>🤖 Fry:</Text></Box>);
-            headerCommittedRef.current = true;
-          }
-          await parseAndAppend(p);
-        }
-        setShowLivePreview(false);
-        setLivePreview('');
-        liveAssistantContentRef.current = '';
         appendTranscript(<Text color="yellow">✗ Response interrupted by user.</Text>);
       }
+
+      // Commit the final, fully rendered message to the static transcript.
+      if (accumulatedOutput) {
+        const finalComponent = (
+          <Box>
+            <Text color="green" bold>🤖 Fry: </Text>
+            <StreamingMarkdown content={accumulatedOutput} />
+          </Box>
+        );
+        appendTranscript(finalComponent);
+      }
+
+      // Hide the streaming component and finish the turn.
+      setStreamingOutput(null);
       setIsProcessing(false);
     }
   };
@@ -714,7 +598,7 @@ const ChatInterface: React.FC<{
           } else {
             setRateLimitStatus(null);
           }
-          appendTranscript(<Text dimColor>────────────────────────</Text>);
+          setStaticItems([]); // Clear the visual transcript
           appendTranscript(
             <Box marginBottom={1}>
               <Text color="cyan" bold>FryCLI</Text>
@@ -744,7 +628,7 @@ const ChatInterface: React.FC<{
       if (token) {
         const isCheckout = userInput.toLowerCase() === '/buy';
         const pageName = isCheckout ? 'checkout page' : 'dashboard';
-        const url = `${client['backendUrl']}/login_with_token/${token}${isCheckout ? '?next=checkout' : ''}`;
+        const url = `${(client as any)['backendUrl']}/login_with_token/${token}${isCheckout ? '?next=checkout' : ''}`;
         
         try {
           await open(url);
@@ -754,6 +638,29 @@ const ChatInterface: React.FC<{
         }
       } else {
         appendTranscript(<Text color="red">Error: Could not generate login link.</Text>);
+      }
+      return;
+    }
+
+    // /key <NEW_KEY> support to swap keys mid-session
+    if (userInput.toLowerCase().startsWith('/key')) {
+      const parts = userInput.split(/\s+/);
+      const maybeKey = parts.slice(1).join(' ').trim();
+      if (!maybeKey) {
+        appendTranscript(<Text color="yellow">Usage: /key &lt;NEW_API_KEY&gt; — key will be saved and used for the next session started with /clear.</Text>);
+        return;
+      }
+      try {
+        await saveApiKeyToEnv(maybeKey);
+        appendTranscript(
+          <Box>
+            <Text color="green">✓ API key saved. Use </Text>
+            <Text color="blue">/clear</Text>
+            <Text color="green"> to start a new session with the updated key.</Text>
+          </Box>
+        );
+      } catch {
+        appendTranscript(<Text color="red">Error: Failed to save API key. You can also set GPT_OSS_API_KEY in {ENV_PATH}</Text>);
       }
       return;
     }
@@ -788,12 +695,11 @@ const ChatInterface: React.FC<{
         {(item, idx) => <Box key={idx}>{item}</Box>}
       </Static>
 
-      {isProcessing && showLivePreview && (
-        <Box marginTop={headerCommittedRef.current ? 0 : 1}>
-          {!headerCommittedRef.current && (
-            <Text color="green" bold>🤖 Fry: </Text>
-          )}
-          <Text>{livePreview}</Text>
+      {/* This component renders the live, streaming response */}
+      {streamingOutput !== null && (
+        <Box>
+          <Text color="green" bold>🤖 Fry: </Text>
+          <StreamingMarkdown content={streamingOutput} />
         </Box>
       )}
 
@@ -808,7 +714,7 @@ const ChatInterface: React.FC<{
       <Box marginTop={1} justifyContent="space-between">
         <Box flexDirection="column">
           <Text dimColor>Shift+Enter for newline, Enter to submit</Text>
-          <Text dimColor>Commands: /dashboard, /buy, /clear, /exit</Text>
+          <Text dimColor>Commands: /dashboard, /buy, /clear, /key, /exit</Text>
         </Box>
         {rateLimitStatus && (
           <Box flexDirection="column" alignItems="flex-end">
@@ -842,10 +748,20 @@ const ChatPrompt: React.FC<{
         onChange(value + '\n');
         return;
       }
+
+      // Ctrl+Backspace → delete previous word
+      if (key.ctrl && key.backspace) {
+        const next = value.replace(/\s+$/, '');
+        const removed = next.replace(/\S+$/, '');
+        onChange(removed);
+        return;
+      }
+
       if (key.backspace) {
         onChange(value.slice(0, -1));
         return;
       }
+
       if (
         !key.ctrl && !key.meta && key.return === false && key.backspace === false &&
         !key.upArrow && !key.downArrow && !key.leftArrow && !key.rightArrow &&
@@ -920,7 +836,7 @@ const loadApiKeyFromEnv = async (): Promise<string | null> => {
   try {
     const content = await fs.readFile(ENV_PATH, 'utf-8');
     const match = content.match(/^GPT_OSS_API_KEY=(.*)$/m);
-    return match ? match[1].trim() : null;
+    return match && typeof match === 'string' ? match.trim() : null;
   } catch (error) {
     return null;
   }
