@@ -498,7 +498,7 @@ const ChatInterface: React.FC<{
             const renderAssistant = (content: string) => (
               <Box>
                 <Text color="green" bold>🤖 Fry: </Text>
-                <StreamingMarkdown content={content} />
+                <StreamingMarkdown content={content} streaming={true} />
               </Box>
             );
 
