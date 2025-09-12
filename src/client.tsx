@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // client.tsx
 import React, { useState, useEffect, useRef } from 'react';
-import { render, Text, Box, useInput, useApp, Static, useStdin, useFocus } from 'ink';
+import { render, Text, Box, useInput, useApp, Static, useStdin } from 'ink';
 import Gradient from 'ink-gradient';
 import SelectInput from 'ink-select-input';
 import { OpenAI } from 'openai/index.mjs';
@@ -782,9 +782,8 @@ const ChatPrompt: React.FC<{
   value: string;
   onChange: (v: string) => void;
   onSubmit: (v: string) => void;
-}> = ({ value, onChange, onSubmit }) => {
-  const { isFocused } = useFocus({ autoFocus: true });
-
+  isActive?: boolean;
+}> = ({ value, onChange, onSubmit, isActive = true }) => {
   useInput(
     (input, key) => {
       if (key.return && !key.shift) {
@@ -812,13 +811,13 @@ const ChatPrompt: React.FC<{
       }
 
       if (
-        !key.ctrl && !key.meta && key.return === false && key.backspace === false &&
+        !key.ctrl && !key.meta && !key.return && !key.backspace &&
         !key.upArrow && !key.downArrow && !key.leftArrow && !key.rightArrow &&
-        key.tab === false && key.escape === false
+        !key.tab && !key.escape
       ) {
         onChange(value + input);
       }
-    }, { isActive: isFocused });
+    }, { isActive });
 
   return (
     <Box>
