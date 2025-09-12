@@ -301,9 +301,7 @@ const ChatInterface: React.FC<{
   const [rateLimitStatus, setRateLimitStatus] = useState<RateLimitStatus | null>(initialRateLimitStatus);
   const isInterruptedRef = useRef(false);
 
-  // Removed transient live preview; we now persist tokens directly.
-  // (kept placeholder state in case future UI needs it)
-  const [streamingOutput, setStreamingOutput] = useState<string | null>(null);
+  // Streaming now uses a live-updating area; finalized output is appended once
 
   const localExecutor = useRef(new LocalToolExecutor());
   const openaiClient = useRef(new OpenAI({ baseURL: modelEndpoint, apiKey: 'dummy' }));
@@ -311,6 +309,7 @@ const ChatInterface: React.FC<{
   const turnMessages = useRef<Message[]>([]);
 
   const appendTranscript = (node: TranscriptItem) => setStaticItems(prev => [...prev, node]);
+  const [liveAssistant, setLiveAssistant] = useState<string>('');
   const lastBlockRef = useRef<'assistant' | 'tool' | 'user' | 'system' | 'other' | null>(null);
 
   useEffect(() => {
@@ -428,10 +427,9 @@ const ChatInterface: React.FC<{
   const processChatTurn = async (userInput: string) => {
     setIsProcessing(true);
     isInterruptedRef.current = false;
+    setLiveAssistant('');
     
     let accumulatedOutput = ''; // Accumulator for the current streamed assistant message
-    // We no longer show a transient live area
-    setStreamingOutput(null);
 
     conversationHistory.current.push({ role: 'user', content: userInput });
     turnMessages.current = [{ role: 'user', content: userInput }];
@@ -450,12 +448,21 @@ const ChatInterface: React.FC<{
       while (true) {
         if (isInterruptedRef.current) break;
 
-        // Reset accumulator for each assistant streaming cycle
+        // Reset accumulator and live area for each assistant streaming cycle
         accumulatedOutput = '';
-        setStreamingOutput(null);
+        setLiveAssistant('');
 
-        // Track and update a single assistant transcript item for this cycle
-        let assistantIndex: number = -1;
+        // Throttled state updates for live area
+        let chunkBuffer = '';
+        const flushChunk = (force = false) => {
+          const now = Date.now();
+          const shouldFlushTime = now - lastRenderTime >= streamIntervalMs;
+          const shouldFlushSize = chunkBuffer.length >= 512;
+          if (!force && !(shouldFlushTime || shouldFlushSize)) return;
+          setLiveAssistant(accumulatedOutput);
+          chunkBuffer = '';
+          lastRenderTime = now;
+        };
 
         const builtinToolsKw = Array.from(new Set(
           (toolsForLlm || [])
@@ -495,35 +502,16 @@ const ChatInterface: React.FC<{
           }
 
           if (delta.content) {
-            const renderAssistant = (content: string) => (
-              <Box>
-                <Text color="green" bold>🤖 Fry: </Text>
-                <StreamingMarkdown content={content} streaming={true} />
-              </Box>
-            );
-
-            if (assistantIndex === -1) {
-              // Create a new assistant item which we'll keep updating
-              setStaticItems(prev => {
-                const next = [...prev, renderAssistant('')];
-                assistantIndex = next.length - 1;
-                return next;
-              });
-            }
-
-            accumulatedOutput += delta.content;
-            // Update the existing assistant item with new content
-            setStaticItems(prev => {
-              const next = [...prev];
-              const index = assistantIndex === -1 ? prev.length - 1 : assistantIndex;
-              next[index] = renderAssistant(accumulatedOutput);
-              return next;
-            });
-            lastRenderTime = Date.now();
+            const piece = delta.content;
+            accumulatedOutput += piece;
+            chunkBuffer += piece;
+            flushChunk(false);
           }
         }
 
-        // No transient live flush; content already persisted token-by-token
+        // Final flush and append finalized assistant message once
+        flushChunk(true);
+        setLiveAssistant('');
 
         const assistantMessage: Message = { role: 'assistant' };
         if (accumulatedOutput.trim().length > 0) {
@@ -545,7 +533,15 @@ const ChatInterface: React.FC<{
         if (assistantMessage.tool_calls) assistantForLlm.tool_calls = assistantMessage.tool_calls;
         (messagesForLlm as any[]).push(assistantForLlm);
 
-        // Do not append the full assistant content again; tokens already persisted
+        // Append finalized assistant message exactly once to the transcript
+        if (assistantMessage.content && assistantMessage.content.length > 0) {
+          appendTranscript(
+            <Box flexDirection="column" marginBottom={1}>
+              <Text color="green" bold>🤖 Fry: </Text>
+              <StreamingMarkdown content={assistantMessage.content} />
+            </Box>
+          );
+        }
 
         if (isInterruptedRef.current) break;
 
@@ -588,6 +584,15 @@ const ChatInterface: React.FC<{
     // This finally block ensures the UI is always cleaned up correctly.
     finally {
       if (isInterruptedRef.current) {
+        if (liveAssistant && liveAssistant.trim().length > 0) {
+          appendTranscript(
+            <Box flexDirection="column" marginBottom={1}>
+              <Text color="green" bold>🤖 Fry (partial): </Text>
+              <StreamingMarkdown content={liveAssistant} />
+            </Box>
+          );
+        }
+        setLiveAssistant('');
         appendTranscript(<Text color="yellow">✗ Response interrupted by user.</Text>);
       }
 
@@ -614,8 +619,8 @@ const ChatInterface: React.FC<{
         turnMessages.current = [];
         conversationHistory.current = [];
 
-        // Clear any visible streamed response when clearing history
-        setStreamingOutput(null);
+        // Clear live area (if any)
+        setLiveAssistant('');
 
         const newSession = await client.startSession();
         if (newSession) {
@@ -722,13 +727,18 @@ const ChatInterface: React.FC<{
 
   return (
     <Box flexDirection="column">
-      <Box flexDirection="column">
-        {staticItems.map((item, idx) => (
+      <Static items={staticItems}>
+        {(item, idx) => (
           <Box key={idx}>{item}</Box>
-        ))}
-      </Box>
+        )}
+      </Static>
 
-      {/* Live streaming area removed; tokens are persisted directly */}
+      {isProcessing && (
+        <Box flexDirection="column" marginBottom={1}>
+          <Text color="green" bold>🤖 Fry: </Text>
+          <StreamingMarkdown content={liveAssistant} streaming />
+        </Box>
+      )}
 
       {!isProcessing && (
         <ChatPrompt
