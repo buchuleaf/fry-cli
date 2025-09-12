@@ -300,6 +300,7 @@ const ChatInterface: React.FC<{
   const [isProcessing, setIsProcessing] = useState(false);
   const [rateLimitStatus, setRateLimitStatus] = useState<RateLimitStatus | null>(initialRateLimitStatus);
   const isInterruptedRef = useRef(false);
+  const LIVE_TAIL_LINES = 40; // limit live area size to reduce terminal jank
 
   // Streaming now uses a live-updating area; finalized output is appended once
 
@@ -736,7 +737,18 @@ const ChatInterface: React.FC<{
       {isProcessing && (
         <Box flexDirection="column" marginBottom={1}>
           <Text color="green" bold>🤖 Fry: </Text>
-          <StreamingMarkdown content={liveAssistant} streaming />
+          {/* Render only the tail to minimize per-frame terminal updates */}
+          <Text>
+            {(() => {
+              const lines = (liveAssistant || '').split('\n');
+              const start = Math.max(0, lines.length - LIVE_TAIL_LINES);
+              const tail = lines.slice(start).join('\n');
+              return tail;
+            })()}
+          </Text>
+          {liveAssistant.split('\n').length > LIVE_TAIL_LINES && (
+            <Text dimColor>{`(showing last ${LIVE_TAIL_LINES} lines...)`}</Text>
+          )}
         </Box>
       )}
 
