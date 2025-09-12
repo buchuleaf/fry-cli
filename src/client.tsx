@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // client.tsx
 import React, { useState, useEffect, useRef } from 'react';
-import { render, Text, Box, useInput, useApp, Static, useStdin } from 'ink';
+import { render, Text, Box, useInput, useApp, Static } from 'ink';
 import Gradient from 'ink-gradient';
 import SelectInput from 'ink-select-input';
 import { OpenAI } from 'openai/index.mjs';
@@ -293,7 +293,7 @@ const ChatInterface: React.FC<{
   streamIntervalMs,
 }) => {
   const { exit } = useApp();
-  const { isRawModeSupported, setRawMode } = useStdin();
+  // Let Ink manage raw mode internally for better Windows compatibility
 
   const [input, setInput] = useState('');
   const [staticItems, setStaticItems] = useState<TranscriptItem[]>([]);
@@ -328,14 +328,7 @@ const ChatInterface: React.FC<{
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  useEffect(() => {
-    try {
-      if (process.platform === 'win32' && isRawModeSupported) {
-        setRawMode(true);
-        return () => { try { setRawMode(false); } catch {} };
-      }
-    } catch {}
-  }, [isRawModeSupported, setRawMode]);
+  // Avoid manually toggling raw mode; fixes input echo on PowerShell
 
   const executeToolCall = async (toolCall: ToolCall): Promise<ToolResult> => {
     const toolName = toolCall.function.name;
