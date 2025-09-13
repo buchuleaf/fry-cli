@@ -1021,7 +1021,7 @@ dotenv.config();
 (async () => {
   await maybeSelfUpdate({ skip: !cli.flags.update });
 
-  const backendUrl = process.env.FRY_BACKEND_URL || 'http://127.0.0.1:8000';
+  const backendUrl = process.env.FRY_BACKEND_URL || 'https://frycli.share.zrok.io';
   const modelName = cli.flags.model || process.env.FRY_MODEL_NAME || 'llama';
 
   render(
