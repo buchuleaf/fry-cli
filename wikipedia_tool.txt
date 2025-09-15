@@ -1,0 +1,223 @@
+"""
+title: Wikipedia (search + wikipedia-api)
+author: you
+version: 1.3.6
+requirements: wikipedia-api
+"""
+
+from typing import List, Dict, Any
+from pydantic import BaseModel, Field
+import requests
+import urllib.parse
+import wikipediaapi
+import json
+
+USER_AGENT = "OpenWebUI-Wikipedia-Bot/0.1"
+TOOL_PREFIX = "wikipedia/"  # Namespaced tool calls must match UI
+
+
+def _rest_search(query: str, lang: str = "en", limit: int = 10) -> List[Dict]:
+    """
+    Internal helper: search Wikipedia page titles using REST API.
+    """
+    url = f"https://{lang}.wikipedia.org/w/rest.php/v1/search/title"
+    headers = {"User-Agent": USER_AGENT}
+    r = requests.get(
+        url, params={"q": query, "limit": limit}, headers=headers, timeout=10
+    )
+    r.raise_for_status()
+    return r.json().get("pages", [])
+
+
+def _page_url(title: str, lang: str = "en") -> str:
+    return f"https://{lang}.wikipedia.org/wiki/{urllib.parse.quote(title.replace(' ', '_'))}"
+
+
+class Tools:
+    """
+    Wikipedia tools for LLMs.
+
+    Policy:
+      - For general queries, call `wikipedia/page_search` first and use exact titles verbatim.
+      - Prefer tool outputs over model memory if they conflict.
+      - Every result includes a Wikipedia Source URL.
+    """
+
+    class Valves(BaseModel):
+        language: str = Field(
+            default="en",
+            description="Wikipedia language edition, e.g. 'en', 'de', 'fr'",
+        )
+        max_results: int = Field(
+            default=10,
+            ge=1,
+            le=20,
+            description="Maximum number of search results to return",
+        )
+
+    class UserValves(BaseModel):
+        pass
+
+    def __init__(self):
+        self.valves = self.Valves()
+        self.user_valves = self.UserValves()
+        self.wiki = wikipediaapi.Wikipedia(
+            language=self.valves.language,
+            user_agent=USER_AGENT,
+        )
+
+    def page_search(self, search_query: str) -> Dict[str, Any]:
+        """
+        Search Wikipedia page titles. Call this first before other tools.
+
+        Output:
+          {
+            "candidates": [ { "page_title": str, "url": str }, ... ]
+          }
+        """
+        if not search_query:
+            return {"error": "Please provide a search query."}
+
+        try:
+            results = _rest_search(
+                search_query, self.valves.language, self.valves.max_results
+            )
+        except Exception as e:
+            return {"error": f"Search error: {e}"}
+
+        if not results:
+            return {"error": "No results found. Try a better search query."}
+
+        candidates: List[Dict[str, Any]] = []
+        for r in results:
+            title = r.get("title", "")
+            if not title:
+                continue
+            candidates.append(
+                {"page_title": title, "url": _page_url(title, self.valves.language)}
+            )
+        return {"candidates": candidates}
+
+    def page_intro(self, page_title: str) -> Dict[str, Any]:
+        """
+        Get the lead/intro paragraph for a Wikipedia page. ⚠️ Not suitable for detailed content. For those, use wikipedia/page_sections + wikipedia/section_text.
+
+        Output:
+          {
+            "page_title": str,
+            "intro": str,
+            "url": str
+          }
+        """
+        
+        if not page_title:
+            return {"error": "Please provide a page title."}
+
+        page = self.wiki.page(page_title)
+        if not page.exists():
+            return {"error": f"Page '{page_title}' not found."}
+
+        return {
+            "page_title": page_title,
+            "intro": page.summary or "No summary available.",
+            "url": _page_url(page_title, self.valves.language),
+        }
+
+    def page_sections(self, page_title: str) -> Dict[str, Any]:
+        """
+        List canonical section names for a Wikipedia page.
+
+        Output:
+          {
+            "sections": [ { "section_title": str, "level": int, "url": str }, ... ]
+          }
+        """
+        page = self.wiki.page(page_title)
+        if not page.exists():
+            return {"error": f"Page '{page_title}' not found."}
+
+        def walk(sections, level=0):
+            out: List[Dict[str, Any]] = []
+            for s in sections:
+                out.append(
+                    {
+                        "section_title": s.title,
+                        "level": level,
+                        "url": _page_url(page_title, self.valves.language),
+                    }
+                )
+                out.extend(walk(s.sections, level + 1))
+            return out
+
+        sections = walk(page.sections)
+        if not sections:
+            return {"error": "No sections found."}
+
+        return {"sections": sections}
+
+    def page_text(self, page_title: str) -> Dict[str, Any]:
+        """
+        Return the full article text for a Wikipedia page.
+
+        Output:
+          {
+            "page_title": str,
+            "page_text": str,
+            "url": str
+          }
+        """
+        if not page_title:
+            return {"error": "Please provide a page title."}
+
+        page = self.wiki.page(page_title)
+        if not page.exists():
+            return {"error": f"Page '{page_title}' not found."}
+
+        return {
+            "page_title": page_title,
+            "page_text": page.text or "No text available.",
+            "url": _page_url(page_title, self.valves.language),
+        }
+
+    def section_text(self, page_title: str, section_title: str) -> Dict[str, Any]:
+        """
+        Get the text of a specific section. Use a section name from `page_sections`.
+
+        Output:
+          {
+            "page_title": str,
+            "section_title": str,
+            "section_text": str,
+            "url": str
+          }
+        """
+        if not page_title:
+            return {"error": "Please provide a page title."}
+        if not section_title:
+            return {"error": "Please provide a section title."}
+
+        page = self.wiki.page(page_title)
+        if not page.exists():
+            return {"error": f"Page '{page_title}' not found."}
+
+        def find_section(sections, target: str):
+            for s in sections:
+                if s.title.lower() == target.lower():
+                    return s
+                result = find_section(s.sections, target)
+                if result:
+                    return result
+            return None
+
+        sec = find_section(page.sections, section_title)
+        if not sec:
+            return {
+                "error": f"Section '{section_title}' not found in page '{page_title}'."
+            }
+
+        return {
+            "page_title": page_title,
+            "section_title": section_title,
+            "section_text": sec.text or "No text available.",
+            "url": _page_url(page_title, self.valves.language),
+        }

@@ -851,7 +851,7 @@ const EndpointSelector: React.FC<{ onSelect: (url: string) => void }> = ({ onSel
     { label: '(2) vLLM (http://localhost:8000/v1)', value: 'http://localhost:8000/v1' },
     { label: '(3) LM Studio (http://localhost:1234/v1)', value: 'http://localhost:1234/v1' },
     { label: '(4) llama.cpp (http://localhost:8080/v1)', value: 'http://localhost:8080/v1' },
-    { label: '(5) Custom URL', value: 'custom' }
+    { label: '(5) Custom URL (http://localhost:10000/v1)', value: 'http://localhost:10000/v1' }
   ];
 
   const [showCustomInput, setShowCustomInput] = useState(false);
