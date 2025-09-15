@@ -78,6 +78,47 @@ export class LocalToolExecutor {
     };
   }
 
+  // Line-safe pagination: ensures each page ends on a full line boundary.
+  // Pages are constructed by packing as many complete lines as fit within pageSize chars.
+  private paginateOutputLineSafe(content: string, page: number, pageSize: number) {
+    const lines = content.split('\n');
+    const chunks: string[] = [];
+    let current: string[] = [];
+    let currentLen = 0;
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      // Length if we add this line. Add 1 char for the newline that existed between lines,
+      // except for the last line in the content which may not have a trailing newline.
+      const addLen = line.length + (i < lines.length - 1 ? 1 : 0);
+      if (currentLen > 0 && currentLen + addLen > pageSize) {
+        chunks.push(current.join('\n'));
+        current = [];
+        currentLen = 0;
+      }
+      current.push(line);
+      currentLen += addLen;
+    }
+    if (current.length > 0) {
+      chunks.push(current.join('\n'));
+    }
+
+    const totalChars = content.length;
+    const totalPages = Math.max(1, chunks.length);
+    const actualPage = Math.max(1, Math.min(page, totalPages));
+    const pageContent = chunks[actualPage - 1] ?? '';
+
+    return {
+      content: pageContent,
+      page: actualPage,
+      page_size: pageSize,
+      total_chars: totalChars,
+      total_pages: totalPages,
+      has_prev: actualPage > 1,
+      has_next: actualPage < totalPages,
+    };
+  }
+
   async execute(toolCall: ToolCall): Promise<ToolResult> {
     const functionName = toolCall.function.name;
     let args: any;
@@ -597,7 +638,8 @@ export class LocalToolExecutor {
       }
 
       const fullOutput = matches.join('\n');
-      const paginated = this.paginateOutput(fullOutput, page, pageSize);
+      // Use line-safe pagination so the last line in each page is complete
+      const paginated = this.paginateOutputLineSafe(fullOutput, page, pageSize);
 
       return { status: 'success', data: paginated };
     } catch (error) {
