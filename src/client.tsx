@@ -529,6 +529,23 @@ const ChatInterface: React.FC<{
 
         const toolAssembler: Map<number, ToolCall> = new Map();
         const toolCalls: ToolCall[] = [];
+        // Live preview string for tool-call construction
+        let toolPreview = '';
+
+        const updateToolPreview = () => {
+          // Show only the first tool call (we only execute one below)
+          const first = toolAssembler.get(0);
+          if (!first) {
+            toolPreview = '';
+            return;
+          }
+          const name = first.function?.name || '';
+          const rawArgs = first.function?.arguments || '';
+          // Keep preview short and robust to invalid/partial JSON
+          const trimmed = rawArgs.length > 400 ? rawArgs.slice(0, 400) + '…' : rawArgs;
+          const header = name ? `🔧 Planning: ${name}(` : '🔧 Planning tool call: (';
+          toolPreview = `${header}${trimmed})`;
+        };
 
         for await (const chunk of stream as AsyncIterable<StreamChunk>) {
           if (isInterruptedRef.current) break;
@@ -547,18 +564,34 @@ const ChatInterface: React.FC<{
               if (tc.function?.name && !acc.function.name) acc.function.name = tc.function.name;
               if (tc.function?.arguments) acc.function.arguments += tc.function.arguments;
             }
+            // Update live preview when tool_call chunks arrive
+            updateToolPreview();
+            // Push an immediate live update so the user sees progress even
+            // if the model is only emitting tool_calls (no content deltas).
+            setLiveAssistant(accumulatedOutput + (toolPreview ? `\n${toolPreview}` : ''));
           }
 
           if (delta.content) {
             const piece = delta.content;
             accumulatedOutput += piece;
             chunkBuffer += piece;
-            flushChunk(false);
+            // Include tool preview in the live area if present
+            const now = Date.now();
+            const shouldFlushTime = now - lastRenderTime >= streamIntervalMs;
+            const shouldFlushSize = chunkBuffer.length >= 512;
+            if (shouldFlushTime || shouldFlushSize) {
+              setLiveAssistant(accumulatedOutput + (toolPreview ? `\n${toolPreview}` : ''));
+              chunkBuffer = '';
+              lastRenderTime = now;
+            }
           }
         }
 
         // Final flush and append finalized assistant message once
+        // Make sure the final live area includes any tool preview
+        setLiveAssistant(accumulatedOutput + (toolPreview ? `\n${toolPreview}` : ''));
         flushChunk(true);
+        // Clear live area right before we append finalized transcript blocks
         setLiveAssistant('');
 
         const assistantMessage: Message = { role: 'assistant' };
