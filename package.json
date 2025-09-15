@@ -5,7 +5,8 @@
   "main": "dist/client.js",
   "type": "module",
   "bin": {
-    "fry": "dist/client.js"
+    "fry": "dist/client.js",
+    "fry-mcp": "dist/mcp/server.js"
   },
   "files": [
     "dist"
@@ -13,7 +14,8 @@
   "scripts": {
     "dev": "tsc && node --enable-source-maps dist/client.js",
     "build": "tsc",
-    "start": "node dist/client.js"
+    "start": "node dist/client.js",
+    "mcp": "node dist/mcp/server.js"
   },
   "dependencies": {
     "axios": "^1.7.2",

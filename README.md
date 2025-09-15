@@ -68,6 +68,26 @@ I plan to continue developing the project. Premium is only for those who wish to
 
 ***Chat histories are not saved.***
 
-## Todo
+## MCP Server (Open WebUI)
 
-- Add MCP support
+This repo now includes a minimal Model Context Protocol (MCP) server that exposes all local tools (exec, shell, python, fs.*) so Open WebUI can orchestrate them while everything runs locally on your machine.
+
+How to use with Open WebUI:
+- Build Fry CLI: `npm run build`
+- Start via Open WebUI MCP integration by adding a server that launches: `node /path/to/fry-cli/dist/mcp/server.js` (or, if installed globally, use the bin `fry-mcp`).
+- The server communicates over stdio and implements: `initialize`, `tools/list`, and `tools/call`.
+
+Exposed tools (names and schemas mirror the CLI):
+- `exec` — `{ runtime: 'shell' | 'python', command?, code?, page?, page_size? }`
+- `shell` — `{ command, page?, page_size? }`
+- `python` — `{ code, page?, page_size? }`
+- `fs.ls` — `{ path? }`
+- `fs.read` — `{ path, start_line?, end_line? }`
+- `fs.write` — `{ path, content }`
+- `fs.mkdir` — `{ path }`
+- `fs.search_files` — `{ pattern, file_pattern?, path?, page?, page_size? }`
+- `fs.apply_patch` — `{ patch }`
+
+Notes:
+- Outputs that are large are paginated (same behavior as the CLI). The MCP server returns text or json content depending on the tool output.
+- All filesystem operations are constrained to the current working directory the server is launched from.
