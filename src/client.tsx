@@ -5,13 +5,11 @@ import { render, Text, Box, useInput, useApp, Static } from 'ink';
 import Gradient from 'ink-gradient';
 import SelectInput from 'ink-select-input';
 import { OpenAI } from 'openai/index.mjs';
-import axios, { AxiosInstance } from 'axios';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as os from 'os';
 import meow from 'meow';
-import dotenv from 'dotenv';
-import open from 'open';
+// import open from 'open'; // removed with auth/dashboard flows
 import { LocalToolExecutor, ToolCall, ToolResult } from './tools.js';
 import * as https from 'https';
 import { spawnSync } from 'child_process';
@@ -163,8 +161,7 @@ marked.use(markedTerminal({
 }));
 
 // ===== Types =====
-interface SessionData { session_id: string; tier: 'free' | 'premium'; }
-interface RateLimitStatus { remaining: number; reset_in_seconds: number; }
+interface SessionData { session_id: string; tier: 'local'; }
 interface Message {
   role: 'user' | 'assistant' | 'system' | 'tool';
   content?: string;
@@ -192,59 +189,120 @@ type StreamChunk = {
   choices?: ChoiceDelta[];
 };
 
-// ===== API Client =====
-class GptOssApiClient {
-  private backendUrl: string;
-  private apiKey: string;
-  private axios: AxiosInstance;
-  constructor(backendUrl: string, apiKey: string) {
-    this.backendUrl = backendUrl.replace(/\/$/, '');
-    this.apiKey = apiKey;
-    this.axios = axios.create({
-      headers: { 'Authorization': `Bearer ${apiKey}` },
-      timeout: 15000
-    });
-  }
-  async startSession(): Promise<any | null> {
-    try {
-      const response = await this.axios.post(`${this.backendUrl}/start_session`);
-      if (response.status === 200) return response.data;
-      return null;
-    } catch { return null; }
-  }
-  async sendWorkspaceContents(sessionId: string, contents: string): Promise<boolean> {
-    try {
-      const response = await this.axios.post(`${this.backendUrl}/workspace_contents`, {
-        session_id: sessionId, contents
-      });
-      return response.status === 200;
-    } catch { return false; }
-  }
-  async prepareChatTurn(sessionId: string, newMessages: Message[]): Promise<any> {
-    const response = await this.axios.post(`${this.backendUrl}/prepare_chat_turn`, {
-      session_id: sessionId, new_messages: newMessages
-    });
-    return response.data;
-  }
-  async orchestrateToolCall(sessionId: string, toolCall: ToolCall): Promise<any> {
-    const response = await this.axios.post(`${this.backendUrl}/orchestrate_tool_call`, {
-      session_id: sessionId, tool_call: toolCall
-    });
-    return response.data;
-  }
-  async trackToolCall(sessionId: string, toolCall: ToolCall): Promise<any> {
-    const response = await this.axios.post(`${this.backendUrl}/track_tool_call`, {
-      session_id: sessionId, tool_call: toolCall
-    });
-    return response.data;
-  }
-  async generateLoginLink(): Promise<string | null> {
-    try {
-      const response = await this.axios.post(`${this.backendUrl}/generate_login_link`);
-      return response.data.token || null;
-    } catch { return null; }
-  }
-}
+// ===== Local tool definitions (exec + fs.*) =====
+const getLocalTools = () => {
+  const tools: any[] = [
+    {
+      type: 'function',
+      function: {
+        name: 'exec',
+        description: "Execute code via a local runtime. Set runtime to 'shell' or 'python'. Returns labeled STDOUT/STDERR; large output is paginated.",
+        parameters: {
+          type: 'object',
+          properties: {
+            runtime: { type: 'string', description: "Runtime to use: 'shell' | 'python'." },
+            command: { type: 'string', description: "Shell command when runtime='shell'." },
+            code: { type: 'string', description: "Python code when runtime='python'." },
+            page: { type: 'integer', description: 'Page number (1-indexed), default 1.' },
+            page_size: { type: 'integer', description: 'Characters per page, default 2000.' }
+          },
+          required: ['runtime']
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'fs.ls',
+        description: 'List files and folders under a directory (relative to project root).',
+        parameters: {
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: "Directory to list (relative). Defaults to '.' if omitted." }
+          }
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'fs.read',
+        description: 'Read lines from a text file. Returns { content, start_line, end_line, total_lines, has_more, next_start_line }.',
+        parameters: {
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: 'File path (relative).' },
+            start_line: { type: 'integer', description: '1-indexed start line (default: 1).' },
+            end_line: { type: 'integer', description: '1-indexed end line (inclusive). If omitted, returns 50 lines.' }
+          },
+          required: ['path']
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'fs.write',
+        description: 'Write text content to a file (creates or overwrites).',
+        parameters: {
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: 'Target file path (relative).' },
+            content: { type: 'string', description: 'Full text content to write.' }
+          },
+          required: ['path', 'content']
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'fs.mkdir',
+        description: 'Create a directory (recursively). No error if it already exists.',
+        parameters: {
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: 'Directory path to create (relative).' }
+          },
+          required: ['path']
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'fs.search_files',
+        description: "Search for a substring across text files. Returns 'path:line:match' lines. Large result sets are paginated.",
+        parameters: {
+          type: 'object',
+          properties: {
+            pattern: { type: 'string', description: 'Substring to match (case-sensitive).' },
+            file_pattern: { type: 'string', description: "Glob of files to include (default '**/*')." },
+            path: { type: 'string', description: 'Optional base directory to scope the search (relative).' },
+            page: { type: 'integer', description: 'Page number to retrieve (1-indexed). Defaults to 1.' },
+            page_size: { type: 'integer', description: 'Number of matches per page. Defaults to 50, max 100.' }
+          },
+          required: ['pattern']
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'fs.apply_patch',
+        description: "Apply multi-file edits using the pseudo-unified patch format bounded by '*** Begin Patch' and '*** End Patch'.",
+        parameters: {
+          type: 'object',
+          properties: {
+            patch: { type: 'string', description: 'Patch text to apply.' }
+          },
+          required: ['patch']
+        }
+      }
+    }
+  ];
+  return tools;
+};
 
 // ===== Small UI bits =====
 const LoadingIndicator: React.FC<{ text: string }> = ({ text }) => (
@@ -275,30 +333,18 @@ const StreamingMarkdown: React.FC<{ content: string; streaming?: boolean }> = ({
 type TranscriptItem = React.ReactNode;
 
 const ChatInterface: React.FC<{
-  client: GptOssApiClient;
   sessionData: SessionData;
   modelEndpoint: string;
   modelName: string;
-  initialRateLimitStatus: RateLimitStatus | null;
   onResetSession: (data: SessionData) => void;
-  streamChunks: boolean;
   streamIntervalMs: number;
-}> = ({
-  client,
-  sessionData,
-  modelEndpoint,
-  modelName,
-  initialRateLimitStatus,
-  onResetSession,
-  streamIntervalMs,
-}) => {
+}> = ({ sessionData, modelEndpoint, modelName, onResetSession, streamIntervalMs }) => {
   const { exit } = useApp();
   // Let Ink manage raw mode internally for better Windows compatibility
 
   const [input, setInput] = useState('');
   const [staticItems, setStaticItems] = useState<TranscriptItem[]>([]);
   const [isProcessing, setIsProcessing] = useState(false);
-  const [rateLimitStatus, setRateLimitStatus] = useState<RateLimitStatus | null>(initialRateLimitStatus);
   const isInterruptedRef = useRef(false);
   const LIVE_TAIL_LINES = 40; // limit live area size to reduce terminal jank
 
@@ -318,7 +364,7 @@ const ChatInterface: React.FC<{
       <Box marginBottom={1}>
         <Text color="cyan" bold>FryCLI</Text>
         <Text> | Session: {sessionData.session_id.substring(0, 8)}... | </Text>
-        <Text color={sessionData.tier === 'premium' ? 'green' : 'yellow'} bold>
+        <Text color={'green'} bold>
           {sessionData.tier.toUpperCase()}
         </Text>
       </Box>
@@ -352,25 +398,16 @@ const ChatInterface: React.FC<{
     );
     lastBlockRef.current = 'tool';
 
-    // Execute (local preferred, with tracking)
+    // Execute locally only
     let result: ToolResult;
     try {
       if (toolName === 'workspace' || toolName === 'exec' || toolName.startsWith('fs.') || toolName === 'python' || toolName === 'shell' || toolName === 'apply_patch') {
-        const trackResponse = await client.trackToolCall(sessionData.session_id, toolCall);
-        if (trackResponse?.rate_limit_status) setRateLimitStatus(trackResponse.rate_limit_status);
         result = await localExecutor.current.execute(toolCall);
       } else {
-        const orchestrationData = await client.orchestrateToolCall(sessionData.session_id, toolCall);
-        result = orchestrationData.result || { status: 'error', data: 'Invalid response from backend.' };
-        if (orchestrationData?.rate_limit_status) setRateLimitStatus(orchestrationData.rate_limit_status);
+        result = { status: 'error', data: `Unknown or unsupported tool: ${toolName}` } as ToolResult;
       }
     } catch (error: any) {
-      if (error.response?.status === 429) {
-        result = { status: 'error', data: error.response.data?.error || 'Rate limit exceeded.' };
-        if (error.response.data?.rate_limit_status) setRateLimitStatus(error.response.data.rate_limit_status);
-      } else {
-        result = { status: 'error', data: `Tool failed: ${error?.message || String(error)}` };
-      }
+      result = { status: 'error', data: `Tool failed: ${error?.message || String(error)}` };
     }
 
     // Render result and also normalize what we send back to the model.
@@ -431,12 +468,34 @@ const ChatInterface: React.FC<{
     let lastRenderTime = Date.now();
 
     try { // Wrap main logic in try/finally to ensure cleanup
-      const rootListing = await getRootDirectoryListing();
-      await client.sendWorkspaceContents(sessionData.session_id, rootListing);
+      const workspaceContents = await getRootDirectoryListing();
+      const includeFs = true;
+      const includeExec = true;
+      const fsGuidance = includeFs
+        ? "\nFilesystem tools (fs.*): fs.ls, fs.read, fs.write, fs.mkdir, fs.search_files, fs.apply_patch.\n" +
+          "- Paths are relative to the current working directory.\n" +
+          "- Use only relative paths, not absolute paths.\n" +
+          "- fs.read: returns up to 200 lines. Params: { path, start_line?, end_line? }. If end_line is omitted, returns 50 lines starting at start_line (default 1).\n" +
+          "  The response includes metadata: { content, start_line, end_line, total_lines, has_more, next_start_line }.\n" +
+          "- For multi-file edits, use fs.apply_patch with the pseudo-unified patch format bounded by '*** Begin Patch' and '*** End Patch'.\n"
+        : '';
+      const execGuidance = includeExec
+        ? "\nExec tool: use { runtime: 'shell' | 'python' } to run local commands/code.\n" +
+          "- Runs in the current working directory.\n" +
+          "- Large outputs are paginated with metadata for navigation.\n"
+        : '';
 
-      const backendData = await client.prepareChatTurn(sessionData.session_id, conversationHistory.current);
-      const messagesForLlm: any[] = backendData.messages || [];
-      const toolsForLlm = backendData.tools || [];
+      const developerContent = (
+        "You are a helpful terminal assistant. Follow all user requests to the best of your abilities\n" +
+        fsGuidance + execGuidance + "\n" +
+        `The current directory contains the following files:\n${workspaceContents}\n`
+      );
+
+      const messagesForLlm: any[] = [
+        { role: 'developer', content: developerContent },
+        ...conversationHistory.current
+      ];
+      const toolsForLlm = getLocalTools();
 
       // === Stream assistant ===
       while (true) {
@@ -458,12 +517,7 @@ const ChatInterface: React.FC<{
           lastRenderTime = now;
         };
 
-        const builtinToolsKw = Array.from(new Set(
-          (toolsForLlm || [])
-            .map((t: any) => t?.function?.name || '')
-            .filter((n: string) => n.startsWith('browser.') || n === 'python')
-            .map((n: string) => (n.startsWith('browser.') ? 'browser' : 'python'))
-        ));
+        const builtinToolsKw: string[] = [];
         const stream = await (openaiClient.current.chat.completions as any).create({
           model: modelName,
           messages: messagesForLlm,
@@ -615,85 +669,31 @@ const ChatInterface: React.FC<{
 
         // Clear live area (if any)
         setLiveAssistant('');
-
-        const newSession = await client.startSession();
-        if (newSession) {
-          const newSessionInfo: SessionData = {
-            session_id: newSession.session_id,
-            tier: newSession.tier
-          };
-          onResetSession(newSessionInfo);
-          if (newSession.rate_limit_status) {
-            setRateLimitStatus(newSession.rate_limit_status);
-          } else {
-            setRateLimitStatus(null);
-          }
-          setStaticItems([]); // Clear the visual transcript
-          appendTranscript(
-            <Box marginBottom={1}>
-              <Text color="cyan" bold>FryCLI</Text>
-              <Text> | Session: {newSessionInfo.session_id.substring(0, 8)}... | </Text>
-              <Text color={newSessionInfo.tier === 'premium' ? 'green' : 'yellow'} bold>
-                {newSessionInfo.tier.toUpperCase()}
-              </Text>
-            </Box>
-          );
-          appendTranscript(
-            <Text dimColor>
-              Working directory: {process.cwd()}
+        const newSessionInfo: SessionData = { session_id: Math.random().toString(36).slice(2, 10), tier: 'local' };
+        onResetSession(newSessionInfo);
+        setStaticItems([]); // Clear the visual transcript
+        appendTranscript(
+          <Box marginBottom={1}>
+            <Text color="cyan" bold>FryCLI</Text>
+            <Text> | Session: {newSessionInfo.session_id.substring(0, 8)}... | </Text>
+            <Text color={'green'} bold>
+              {newSessionInfo.tier.toUpperCase()}
             </Text>
-          );
-          appendTranscript(<Text color="yellow">History cleared. New session started.</Text>);
-        } else {
-          appendTranscript(<Text color="red">Error: Could not start a new session. Try again.</Text>);
-        }
+          </Box>
+        );
+        appendTranscript(
+          <Text dimColor>
+            Working directory: {process.cwd()}
+          </Text>
+        );
+        appendTranscript(<Text color="yellow">History cleared. New session started.</Text>);
       } finally {
         setIsProcessing(false);
       }
       return;
     }
 
-    if (userInput.toLowerCase() === '/dashboard' || userInput.toLowerCase() === '/buy') {
-      const token = await client.generateLoginLink();
-      if (token) {
-        const isCheckout = userInput.toLowerCase() === '/buy';
-        const pageName = isCheckout ? 'checkout page' : 'dashboard';
-        const url = `${(client as any)['backendUrl']}/login_with_token/${token}${isCheckout ? '?next=checkout' : ''}`;
-        
-        try {
-          await open(url);
-          appendTranscript(<Text color="green">✓ Opening the {pageName} in your browser...</Text>);
-        } catch {
-          appendTranscript(<Text color="yellow">✓ Could not open browser. Here is the link for the {pageName}:{"\n"}{url}</Text>);
-        }
-      } else {
-        appendTranscript(<Text color="red">Error: Could not generate login link.</Text>);
-      }
-      return;
-    }
-
-    // /key <NEW_KEY> support to swap keys mid-session
-    if (userInput.toLowerCase().startsWith('/key')) {
-      const parts = userInput.split(/\s+/);
-      const maybeKey = parts.slice(1).join(' ').trim();
-      if (!maybeKey) {
-        appendTranscript(<Text color="yellow">Usage: /key &lt;NEW_API_KEY&gt; — key will be saved and used for the next session started with /clear.</Text>);
-        return;
-      }
-      try {
-        await saveApiKeyToEnv(maybeKey);
-        appendTranscript(
-          <Box>
-            <Text color="green">✓ API key saved. Use </Text>
-            <Text color="blue">/clear</Text>
-            <Text color="green"> to start a new session with the updated key.</Text>
-          </Box>
-        );
-      } catch {
-        appendTranscript(<Text color="red">Error: Failed to save API key. You can also set GPT_OSS_API_KEY in {ENV_PATH}</Text>);
-      }
-      return;
-    }
+    // Auth/dashboard/key commands removed in local-only mode
 
     appendTranscript(
       <Box flexDirection="column" marginBottom={1}>
@@ -756,16 +756,8 @@ const ChatInterface: React.FC<{
       <Box marginTop={1} justifyContent="space-between">
         <Box flexDirection="column">
           <Text dimColor>Shift+Enter for newline, Enter to submit</Text>
-          <Text dimColor>Commands: /dashboard, /buy, /clear, /key, /exit</Text>
+          <Text dimColor>Commands: /clear, /exit</Text>
         </Box>
-        {rateLimitStatus && (
-          <Box flexDirection="column" alignItems="flex-end">
-            <Text dimColor>Tool Calls: {rateLimitStatus.remaining}</Text>
-            <Text dimColor>
-              (resets in {Math.floor(rateLimitStatus.reset_in_seconds / 3600)}h {Math.ceil((rateLimitStatus.reset_in_seconds % 3600) / 60)}m)
-            </Text>
-          </Box>
-        )}
       </Box>
     </Box>
   );
@@ -861,104 +853,15 @@ const EndpointSelector: React.FC<{ onSelect: (url: string) => void }> = ({ onSel
   );
 };
 
-const ENV_DIR = path.join(os.homedir(), '.gpt-oss-client');
-const ENV_PATH = path.join(ENV_DIR, '.env');
-
-const saveApiKeyToEnv = async (key: string) => {
-  try {
-    await fs.mkdir(ENV_DIR, { recursive: true });
-    await fs.writeFile(ENV_PATH, `GPT_OSS_API_KEY=${key}\n`);
-  } catch (error) {
-    // Silently fail
-  }
-};
-
-const loadApiKeyFromEnv = async (): Promise<string | null> => {
-  try {
-    const content = await fs.readFile(ENV_PATH, 'utf-8');
-    const match = content.match(/^GPT_OSS_API_KEY=(.*)$/m);
-    return match ? match[1].trim() : null;
-  } catch (error) {
-    return null;
-  }
-};
-
-const ApiKeyInput: React.FC<{ backendUrl: string; onAuthenticated: (sessionResponse: any, apiKey: string) => void }> = ({ backendUrl, onAuthenticated }) => {
-  const [apiKey, setApiKey] = useState('');
-  const [isAuthenticating, setIsAuthenticating] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    const findAndAuthKey = async () => {
-      const envKey = process.env.GPT_OSS_API_KEY || await loadApiKeyFromEnv();
-      if (envKey) {
-        authenticateWithKey(envKey);
-      }
-    };
-    findAndAuthKey();
-  }, []);
-
-  const authenticateWithKey = async (key: string) => {
-    setIsAuthenticating(true);
-    setError(null);
-
-    const client = new GptOssApiClient(backendUrl, key);
-    const sessionResponse = await client.startSession();
-
-    if (sessionResponse) {
-      await saveApiKeyToEnv(key);
-      onAuthenticated(sessionResponse, key);
-    } else {
-      setError('Invalid or expired API key.');
-      setIsAuthenticating(false);
-    }
-  };
-
-  const handleSubmit = (value: string) => {
-    if (value.trim()) {
-      authenticateWithKey(value.trim());
-    }
-  };
-
-  if (isAuthenticating) {
-    return <LoadingIndicator text="Authenticating..." />;
-  }
-
-  return (
-    <Box flexDirection="column">
-      <Text color="cyan" bold>FryCLI API Key Required</Text>
-      <Text>Generate an API key from: {backendUrl}/dashboard</Text>
-      {error && <Text color="red">{error}</Text>}
-      <Box marginTop={1}>
-        <Text>Enter API key: </Text>
-        <ChatPrompt value={apiKey} onChange={setApiKey} onSubmit={handleSubmit} />
-      </Box>
-    </Box>
-  );
-};
-
-const App: React.FC<{ backendUrl: string; modelName: string; streamChunks: boolean; streamIntervalMs: number; }> = ({ backendUrl, modelName, streamChunks, streamIntervalMs }) => {
-  const [stage, setStage] = useState<'endpoint' | 'auth' | 'chat'>('endpoint');
+const App: React.FC<{ modelName: string; streamIntervalMs: number; }> = ({ modelName, streamIntervalMs }) => {
+  const [stage, setStage] = useState<'endpoint' | 'chat'>('endpoint');
   const [modelEndpoint, setModelEndpoint] = useState<string | null>(null);
   const [sessionData, setSessionData] = useState<SessionData | null>(null);
-  const [apiKey, setApiKey] = useState<string | null>(null);
-  const [initialRateLimit, setInitialRateLimit] = useState<RateLimitStatus | null>(null);
 
   const handleEndpointSelect = (url: string) => {
     setModelEndpoint(url);
-    setStage('auth');
-  };
-
-  const handleAuthenticated = (sessionResponse: any, key: string) => {
-    const sessionInfo: SessionData = {
-        session_id: sessionResponse.session_id,
-        tier: sessionResponse.tier
-    };
+    const sessionInfo: SessionData = { session_id: Math.random().toString(36).slice(2, 10), tier: 'local' };
     setSessionData(sessionInfo);
-    setApiKey(key);
-    if (sessionResponse.rate_limit_status) {
-        setInitialRateLimit(sessionResponse.rate_limit_status);
-    }
     setStage('chat');
   };
 
@@ -973,23 +876,15 @@ const App: React.FC<{ backendUrl: string; modelName: string; streamChunks: boole
       )}
 
       {stage === 'endpoint' && <EndpointSelector onSelect={handleEndpointSelect} />}
-      
-      {stage === 'auth' && (
-        <ApiKeyInput backendUrl={backendUrl} onAuthenticated={handleAuthenticated} />
-      )}
-      
-      {stage === 'chat' && sessionData && apiKey && modelEndpoint && (
+
+      {stage === 'chat' && sessionData && modelEndpoint && (
         <ChatInterface
-          client={new GptOssApiClient(backendUrl, apiKey)}
           sessionData={sessionData}
           modelEndpoint={modelEndpoint}
           modelName={modelName}
-          initialRateLimitStatus={initialRateLimit}
-          streamChunks={streamChunks}
           streamIntervalMs={streamIntervalMs}
           onResetSession={(data) => {
             setSessionData(data);
-            setInitialRateLimit(null);
           }}
         />
       )}
@@ -1016,21 +911,12 @@ Options
   }
 );
 
-dotenv.config();
-
 (async () => {
   await maybeSelfUpdate({ skip: !cli.flags.update });
-
-  const backendUrl = 'http://0.0.0.0:8000';
   const modelName = cli.flags.model || process.env.FRY_MODEL_NAME || 'llama';
 
   render(
-    <App
-      backendUrl={backendUrl}
-      modelName={modelName}
-      streamChunks={true}
-      streamIntervalMs={60}
-    />,
+    <App modelName={modelName} streamIntervalMs={60} />,
     { exitOnCtrlC: false }
   );
 })();
