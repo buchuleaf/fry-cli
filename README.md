@@ -11,13 +11,8 @@
 
 ## Example test
 
-### Web browsing
->**Prompt:** Go through the web and extract data about recent advancements in LLM's. Then, do an analysis on the extracted data and present a report in an HTML page.
-
-![web_browsing](assets/web_browsing_test.gif)
-
 ### Coding/File browsing
->**Prompt:** Go through `examples/gpt-oss` and explain how one can implement a chat interface with the model `gpt-oss?`
+>**Prompt:** Go through `examples/gpt-oss` and explain how one can implement a chat interface with the model `gpt-oss`.
 ![coding](assets/coding_test.gif)
 
 ## Requirements
@@ -38,16 +33,6 @@ Run `fry` from any directory.
 fry
 ```
 
-## Authentication
-
-- Login with Google OAuth to access the dashboard and generate an API key
-- Enter the API key when asked for one
-
-## Limits
-
-- **Free**: 200 tool requests per 5 hours
-- **Premium**: 5000 tool requests per 5 hours ($10/mo)
-
 ## Example setup
 
 1. `llama.cpp` to host the model
@@ -60,34 +45,14 @@ fry
 5. Generate and enter API key
 6. Begin!
 
-## Notes
-
-I plan to continue developing the project. Premium is only for those who wish to support continued development.
-
-*Support for other models in consideration...*
-
-***Chat histories are not saved.***
-
 ## MCP Server (Open WebUI)
-
-This repo now includes a minimal Model Context Protocol (MCP) server that exposes all local tools (exec, shell, python, fs.*) so Open WebUI can orchestrate them while everything runs locally on your machine.
+*Under development*
 
 How to use with Open WebUI:
 - Build Fry CLI: `npm run build`
 - Start via Open WebUI MCP integration by adding a server that launches: `node /path/to/fry-cli/dist/mcp/server.js` (or, if installed globally, use the bin `fry-mcp`).
 - The server communicates over stdio and implements: `initialize`, `tools/list`, and `tools/call`.
 
-Exposed tools (names and schemas mirror the CLI):
-- `exec` — `{ runtime: 'shell' | 'python', command?, code?, page?, page_size? }`
-- `shell` — `{ command, page?, page_size? }`
-- `python` — `{ code, page?, page_size? }`
-- `fs.ls` — `{ path? }`
-- `fs.read` — `{ path, start_line?, end_line? }`
-- `fs.write` — `{ path, content }`
-- `fs.mkdir` — `{ path }`
-- `fs.search_files` — `{ pattern, file_pattern?, path?, page?, page_size? }`
-- `fs.apply_patch` — `{ patch }`
-
-Notes:
+## Notes:
 - Outputs that are large are paginated (same behavior as the CLI). The MCP server returns text or json content depending on the tool output.
 - All filesystem operations are constrained to the current working directory the server is launched from.
