@@ -304,6 +304,15 @@ const getLocalTools = () => {
   return tools;
 };
 
+const clearTerminalOutput = () => {
+  console.clear();
+
+  if (!process.stdout.isTTY) return;
+
+  // Clear scrollback and move cursor to top-left for a clean slate
+  process.stdout.write('\u001B[3J\u001B[2J\u001B[H');
+};
+
 // ===== Small UI bits =====
 const LoadingIndicator: React.FC<{ text: string }> = ({ text }) => (
   <Box><Text color="cyan">{text}</Text></Box>
@@ -346,9 +355,7 @@ const ChatInterface: React.FC<{
   const [staticItems, setStaticItems] = useState<TranscriptItem[]>([]);
   const [isProcessing, setIsProcessing] = useState(false);
   const isInterruptedRef = useRef(false);
-  const LIVE_TAIL_LINES = 40; // limit live area size to reduce terminal jank
-
-  // Streaming now uses a live-updating area; finalized output is appended once
+  // We avoid live re-rendering during streaming to prevent terminal yank.
 
   const localExecutor = useRef(new LocalToolExecutor());
   const openaiClient = useRef(new OpenAI({ baseURL: modelEndpoint, apiKey: 'dummy' }));
@@ -356,7 +363,6 @@ const ChatInterface: React.FC<{
   const turnMessages = useRef<Message[]>([]);
 
   const appendTranscript = (node: TranscriptItem) => setStaticItems(prev => [...prev, node]);
-  const [liveAssistant, setLiveAssistant] = useState<string>('');
   const lastBlockRef = useRef<'assistant' | 'tool' | 'user' | 'system' | 'other' | null>(null);
 
   useEffect(() => {
@@ -458,14 +464,12 @@ const ChatInterface: React.FC<{
   const processChatTurn = async (userInput: string) => {
     setIsProcessing(true);
     isInterruptedRef.current = false;
-    setLiveAssistant('');
-    
     let accumulatedOutput = ''; // Accumulator for the current streamed assistant message
 
     conversationHistory.current.push({ role: 'user', content: userInput });
     turnMessages.current = [{ role: 'user', content: userInput }];
 
-    let lastRenderTime = Date.now();
+    // No periodic re-renders; we stream directly to stdout.
 
     try { // Wrap main logic in try/finally to ensure cleanup
       const workspaceContents = await getRootDirectoryListing();
@@ -501,21 +505,14 @@ const ChatInterface: React.FC<{
       while (true) {
         if (isInterruptedRef.current) break;
 
-        // Reset accumulator and live area for each assistant streaming cycle
+        // Reset accumulator for each assistant streaming cycle
         accumulatedOutput = '';
-        setLiveAssistant('');
 
-        // Throttled state updates for live area
-        let chunkBuffer = '';
-        const flushChunk = (force = false) => {
-          const now = Date.now();
-          const shouldFlushTime = now - lastRenderTime >= streamIntervalMs;
-          const shouldFlushSize = chunkBuffer.length >= 512;
-          if (!force && !(shouldFlushTime || shouldFlushSize)) return;
-          setLiveAssistant(accumulatedOutput);
-          chunkBuffer = '';
-          lastRenderTime = now;
-        };
+        // Print assistant header and a newline once before streaming tokens
+        try {
+          process.stdout.write("\n");
+          process.stdout.write("🤖 Fry:\n");
+        } catch {}
 
         const builtinToolsKw: string[] = [];
         const stream = await (openaiClient.current.chat.completions as any).create({
@@ -529,23 +526,7 @@ const ChatInterface: React.FC<{
 
         const toolAssembler: Map<number, ToolCall> = new Map();
         const toolCalls: ToolCall[] = [];
-        // Live preview string for tool-call construction
-        let toolPreview = '';
-
-        const updateToolPreview = () => {
-          // Show only the first tool call (we only execute one below)
-          const first = toolAssembler.get(0);
-          if (!first) {
-            toolPreview = '';
-            return;
-          }
-          const name = first.function?.name || '';
-          const rawArgs = first.function?.arguments || '';
-          // Keep preview short and robust to invalid/partial JSON
-          const trimmed = rawArgs.length > 400 ? rawArgs.slice(0, 400) + '…' : rawArgs;
-          const header = name ? `🔧 Planning: ${name}(` : '🔧 Planning tool call: (';
-          toolPreview = `${header}${trimmed})`;
-        };
+        // We skip live tool-call preview to avoid dynamic redraws.
 
         for await (const chunk of stream as AsyncIterable<StreamChunk>) {
           if (isInterruptedRef.current) break;
@@ -564,35 +545,22 @@ const ChatInterface: React.FC<{
               if (tc.function?.name && !acc.function.name) acc.function.name = tc.function.name;
               if (tc.function?.arguments) acc.function.arguments += tc.function.arguments;
             }
-            // Update live preview when tool_call chunks arrive
-            updateToolPreview();
-            // Push an immediate live update so the user sees progress even
-            // if the model is only emitting tool_calls (no content deltas).
-            setLiveAssistant(accumulatedOutput + (toolPreview ? `\n${toolPreview}` : ''));
+            // Collect tool call chunks; no live preview to avoid redraws
           }
 
           if (delta.content) {
             const piece = delta.content;
             accumulatedOutput += piece;
-            chunkBuffer += piece;
-            // Include tool preview in the live area if present
-            const now = Date.now();
-            const shouldFlushTime = now - lastRenderTime >= streamIntervalMs;
-            const shouldFlushSize = chunkBuffer.length >= 512;
-            if (shouldFlushTime || shouldFlushSize) {
-              setLiveAssistant(accumulatedOutput + (toolPreview ? `\n${toolPreview}` : ''));
-              chunkBuffer = '';
-              lastRenderTime = now;
-            }
+            try {
+              process.stdout.write(piece);
+            } catch {}
           }
         }
 
-        // Final flush and append finalized assistant message once
-        // Make sure the final live area includes any tool preview
-        setLiveAssistant(accumulatedOutput + (toolPreview ? `\n${toolPreview}` : ''));
-        flushChunk(true);
-        // Clear live area right before we append finalized transcript blocks
-        setLiveAssistant('');
+        // Ensure trailing newline after streaming content
+        try {
+          if (!accumulatedOutput.endsWith('\n')) process.stdout.write('\n');
+        } catch {}
 
         const assistantMessage: Message = { role: 'assistant' };
         if (accumulatedOutput.trim().length > 0) {
@@ -614,15 +582,7 @@ const ChatInterface: React.FC<{
         if (assistantMessage.tool_calls) assistantForLlm.tool_calls = assistantMessage.tool_calls;
         (messagesForLlm as any[]).push(assistantForLlm);
 
-        // Append finalized assistant message exactly once to the transcript
-        if (assistantMessage.content && assistantMessage.content.length > 0) {
-          appendTranscript(
-            <Box flexDirection="column" marginBottom={1}>
-              <Text color="green" bold>🤖 Fry: </Text>
-              <StreamingMarkdown content={assistantMessage.content} />
-            </Box>
-          );
-        }
+        // Do not append content again; it was streamed above. Avoid double-printing.
 
         if (isInterruptedRef.current) break;
 
@@ -665,15 +625,6 @@ const ChatInterface: React.FC<{
     // This finally block ensures the UI is always cleaned up correctly.
     finally {
       if (isInterruptedRef.current) {
-        if (liveAssistant && liveAssistant.trim().length > 0) {
-          appendTranscript(
-            <Box flexDirection="column" marginBottom={1}>
-              <Text color="green" bold>🤖 Fry (partial): </Text>
-              <StreamingMarkdown content={liveAssistant} />
-            </Box>
-          );
-        }
-        setLiveAssistant('');
         appendTranscript(<Text color="yellow">✗ Response interrupted by user.</Text>);
       }
 
@@ -700,8 +651,8 @@ const ChatInterface: React.FC<{
         turnMessages.current = [];
         conversationHistory.current = [];
 
-        // Clear live area (if any)
-        setLiveAssistant('');
+        clearTerminalOutput();
+        // Reset session metadata and transcript state after clearing the terminal
         const newSessionInfo: SessionData = { session_id: Math.random().toString(36).slice(2, 10), tier: 'local' };
         onResetSession(newSessionInfo);
         setStaticItems([]); // Clear the visual transcript
@@ -720,6 +671,7 @@ const ChatInterface: React.FC<{
           </Text>
         );
         appendTranscript(<Text color="yellow">History cleared. New session started.</Text>);
+        lastBlockRef.current = 'system';
       } finally {
         setIsProcessing(false);
       }
@@ -760,23 +712,7 @@ const ChatInterface: React.FC<{
         )}
       </Static>
 
-      {isProcessing && (
-        <Box flexDirection="column" marginBottom={1}>
-          <Text color="green" bold>🤖 Fry: </Text>
-          {/* Render only the tail to minimize per-frame terminal updates */}
-          <Text>
-            {(() => {
-              const lines = (liveAssistant || '').split('\n');
-              const start = Math.max(0, lines.length - LIVE_TAIL_LINES);
-              const tail = lines.slice(start).join('\n');
-              return tail;
-            })()}
-          </Text>
-          {liveAssistant.split('\n').length > LIVE_TAIL_LINES && (
-            <Text dimColor>{`(showing last ${LIVE_TAIL_LINES} lines...)`}</Text>
-          )}
-        </Box>
-      )}
+      {/* No live area during streaming; we write directly to stdout. */}
 
       {!isProcessing && (
         <ChatPrompt
