@@ -119,6 +119,74 @@ export class LocalToolExecutor {
     };
   }
 
+  private chunkText(text: string, rawPageSize: number): string[] {
+    const safeSize = Math.max(1, Math.floor(rawPageSize));
+    if (text.length <= safeSize) return [text];
+
+    const chunks: string[] = [];
+    for (let i = 0; i < text.length; i += safeSize) {
+      chunks.push(text.slice(i, i + safeSize));
+    }
+    return chunks;
+  }
+
+  private expandSearchMatch(
+    match: { path: string; line: number; text: string },
+    rawPageSize: number
+  ): string[] {
+    const safePageSize = Math.max(1, Math.floor(rawPageSize));
+    const lineText = match.text ?? '';
+    const basePrefix = `${match.path}:${match.line}`;
+    const firstPrefix = `${basePrefix}:`;
+    const fullLine = `${firstPrefix}${lineText}`;
+
+    if (fullLine.length <= safePageSize) {
+      return [fullLine];
+    }
+
+    // If even the prefix alone exceeds the page size, fall back to raw chunking.
+    if (firstPrefix.length >= safePageSize) {
+      return this.chunkText(fullLine, safePageSize);
+    }
+
+    const segments: string[] = [];
+    let remaining = lineText;
+
+    const maxFirstBody = safePageSize - firstPrefix.length;
+    const firstChunk = remaining.slice(0, maxFirstBody);
+    segments.push(`${firstPrefix}${firstChunk}`);
+    remaining = remaining.slice(firstChunk.length);
+
+    let continuationIndex = 2;
+    while (remaining.length > 0) {
+      const contPrefix = `${basePrefix} (cont ${continuationIndex}):`;
+      const available = safePageSize - contPrefix.length;
+
+      if (available <= 0) {
+        segments.push(...this.chunkText(`${contPrefix}${remaining}`, safePageSize));
+        break;
+      }
+
+      const chunk = remaining.slice(0, available);
+      segments.push(`${contPrefix}${chunk}`);
+      remaining = remaining.slice(chunk.length);
+      continuationIndex += 1;
+    }
+
+    return segments;
+  }
+
+  private expandSearchMatchesForPagination(
+    matches: Array<{ path: string; line: number; text: string }>,
+    pageSize: number
+  ): string[] {
+    const expanded: string[] = [];
+    for (const match of matches) {
+      expanded.push(...this.expandSearchMatch(match, pageSize));
+    }
+    return expanded;
+  }
+
   async execute(toolCall: ToolCall): Promise<ToolResult> {
     const functionName = toolCall.function.name;
     let args: any;
@@ -591,7 +659,7 @@ export class LocalToolExecutor {
         });
       }
 
-      const matches: string[] = [];
+      const matches: Array<{ path: string; line: number; text: string }> = [];
 
       // Layer 2: For remaining files, perform a content-based check for binary data.
       // This helper function reads the first 1KB of a file and checks for a NULL byte.
@@ -622,10 +690,10 @@ export class LocalToolExecutor {
           const content = await fs.readFile(file, 'utf-8');
           const lines = content.split('\n');
           
+          const relativePath = path.relative(this.workspaceDir, file);
           lines.forEach((line, i) => {
             if (line.includes(pattern)) {
-              const relativePath = path.relative(this.workspaceDir, file);
-              matches.push(`${relativePath}:${i + 1}:${line.trim()}`);
+              matches.push({ path: relativePath, line: i + 1, text: line.trim() });
             }
           });
         } catch {
@@ -637,7 +705,8 @@ export class LocalToolExecutor {
         return { status: 'success', data: `No matches found for '${pattern}'.` };
       }
 
-      const fullOutput = matches.join('\n');
+      const expandedMatches = this.expandSearchMatchesForPagination(matches, pageSize);
+      const fullOutput = expandedMatches.join('\n');
       // Use line-safe pagination so the last line in each page is complete
       const paginated = this.paginateOutputLineSafe(fullOutput, page, pageSize);
 
