@@ -338,6 +338,53 @@ const StreamingMarkdown: React.FC<{ content: string; streaming?: boolean }> = ({
   return <Text>{toRender}</Text>;
 };
 
+const STREAMING_TAIL_THRESHOLD = 600;
+
+const hasOpenCodeFence = (text: string): boolean => {
+  const fences = text.match(/```/g);
+  return !!fences && (fences.length % 2 === 1);
+};
+
+const computeFlushIndex = (fullText: string, flushedLength: number, final: boolean): number => {
+  if (final) return fullText.length;
+  const remaining = fullText.length - flushedLength;
+  if (remaining <= STREAMING_TAIL_THRESHOLD) return flushedLength;
+
+  const slice = fullText.slice(flushedLength);
+  const flushTarget = remaining - STREAMING_TAIL_THRESHOLD;
+  const window = slice.slice(0, flushTarget);
+
+  let candidateOffset = flushTarget;
+  const windowNewline = window.lastIndexOf('\n');
+  if (windowNewline !== -1) {
+    candidateOffset = windowNewline + 1;
+  } else {
+    const windowSpace = window.lastIndexOf(' ');
+    if (windowSpace !== -1) candidateOffset = windowSpace + 1;
+  }
+
+  let candidate = flushedLength + candidateOffset;
+  if (candidate <= flushedLength) return flushedLength;
+
+  if (hasOpenCodeFence(fullText.slice(0, candidate))) {
+    const rest = fullText.slice(candidate);
+    const closing = rest.indexOf('```');
+    if (closing === -1) return flushedLength;
+    candidate += closing + 3;
+  }
+
+  return Math.min(candidate, fullText.length);
+};
+
+const AssistantChunk: React.FC<{ markdown: string; isFirst: boolean; isFinal: boolean; }> = ({ markdown, isFirst, isFinal }) => (
+  <Box flexDirection="column" marginBottom={isFinal ? 1 : 0}>
+    {isFirst && <Text color="green" bold>🤖 Fry:</Text>}
+    <Box marginLeft={isFirst ? 0 : 2}>
+      <StreamingMarkdown content={markdown} streaming={false} />
+    </Box>
+  </Box>
+);
+
 // ===== Chat Component =====
 type TranscriptItem = React.ReactNode;
 
@@ -355,6 +402,7 @@ const ChatInterface: React.FC<{
   const [staticItems, setStaticItems] = useState<TranscriptItem[]>([]);
   const [isProcessing, setIsProcessing] = useState(false);
   const [liveAssistantContent, setLiveAssistantContent] = useState<string | null>(null);
+  const [showLiveAssistantHeader, setShowLiveAssistantHeader] = useState(true);
   const isInterruptedRef = useRef(false);
   // Stream via React state so the terminal isn't cleared/redrawn wholesale.
 
@@ -508,7 +556,59 @@ const ChatInterface: React.FC<{
 
         // Reset accumulator for each assistant streaming cycle
         accumulatedOutput = '';
+        let flushedLength = 0;
+        let printedChunks = 0;
         setLiveAssistantContent('');
+        setShowLiveAssistantHeader(true);
+
+        const flushAssistantOutput = (final: boolean) => {
+          let progressed = false;
+          while (true) {
+            const targetIndex = computeFlushIndex(accumulatedOutput, flushedLength, final);
+            if (targetIndex <= flushedLength) break;
+
+            const chunk = accumulatedOutput.slice(flushedLength, targetIndex);
+            const isFirstChunk = printedChunks === 0;
+            const isFinalChunk = final && targetIndex === accumulatedOutput.length;
+
+            appendTranscript(
+              <AssistantChunk
+                markdown={chunk}
+                isFirst={isFirstChunk}
+                isFinal={isFinalChunk}
+              />
+            );
+
+            flushedLength = targetIndex;
+            printedChunks += 1;
+            progressed = true;
+
+            if (isFirstChunk) setShowLiveAssistantHeader(false);
+            if (isFinalChunk) lastBlockRef.current = 'assistant';
+          }
+
+          const tail = accumulatedOutput.slice(flushedLength);
+          if (final) {
+            if (!progressed && tail.length > 0) {
+              const isFirstChunk = printedChunks === 0;
+              appendTranscript(
+                <AssistantChunk
+                  markdown={tail}
+                  isFirst={isFirstChunk}
+                  isFinal={true}
+                />
+              );
+              printedChunks += 1;
+              flushedLength = accumulatedOutput.length;
+              lastBlockRef.current = 'assistant';
+              if (isFirstChunk) setShowLiveAssistantHeader(false);
+            }
+            setLiveAssistantContent(null);
+            setShowLiveAssistantHeader(true);
+          } else {
+            setLiveAssistantContent(tail);
+          }
+        };
 
         const builtinToolsKw: string[] = [];
         const stream = await (openaiClient.current.chat.completions as any).create({
@@ -547,9 +647,10 @@ const ChatInterface: React.FC<{
           if (delta.content) {
             const piece = delta.content;
             accumulatedOutput += piece;
-            setLiveAssistantContent(accumulatedOutput);
+            flushAssistantOutput(false);
           }
         }
+        flushAssistantOutput(true);
         const assistantMessage: Message = { role: 'assistant' };
         if (accumulatedOutput.trim().length > 0) {
           assistantMessage.content = accumulatedOutput;
@@ -569,17 +670,6 @@ const ChatInterface: React.FC<{
         if (assistantMessage.content) assistantForLlm.content = assistantMessage.content;
         if (assistantMessage.tool_calls) assistantForLlm.tool_calls = assistantMessage.tool_calls;
         (messagesForLlm as any[]).push(assistantForLlm);
-
-        if (accumulatedOutput.length > 0) {
-          appendTranscript(
-            <Box flexDirection="column" marginBottom={1}>
-              <Text color="green" bold>🤖 Fry:</Text>
-              <StreamingMarkdown content={accumulatedOutput} streaming={false} />
-            </Box>
-          );
-          lastBlockRef.current = 'assistant';
-        }
-        setLiveAssistantContent(null);
 
         // Content already persisted; continue looping for tool calls if needed.
 
@@ -629,6 +719,7 @@ const ChatInterface: React.FC<{
         appendTranscript(<Text color="yellow">✗ Response interrupted by user.</Text>);
       }
 
+      setShowLiveAssistantHeader(true);
       setIsProcessing(false);
     }
   };
@@ -715,9 +806,11 @@ const ChatInterface: React.FC<{
 
       {liveAssistantContent !== null && (
         <Box flexDirection="column" marginTop={1} marginBottom={1}>
-          <Text color="green" bold>🤖 Fry:</Text>
+          {showLiveAssistantHeader && <Text color="green" bold>🤖 Fry:</Text>}
           {liveAssistantContent.length > 0 && (
-            <StreamingMarkdown content={liveAssistantContent} streaming />
+            <Box marginLeft={showLiveAssistantHeader ? 0 : 2}>
+              <StreamingMarkdown content={liveAssistantContent} streaming />
+            </Box>
           )}
         </Box>
       )}
