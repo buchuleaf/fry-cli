@@ -354,8 +354,9 @@ const ChatInterface: React.FC<{
   const [input, setInput] = useState('');
   const [staticItems, setStaticItems] = useState<TranscriptItem[]>([]);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [liveAssistantContent, setLiveAssistantContent] = useState<string | null>(null);
   const isInterruptedRef = useRef(false);
-  // We avoid live re-rendering during streaming to prevent terminal yank.
+  // Stream via React state so the terminal isn't cleared/redrawn wholesale.
 
   const localExecutor = useRef(new LocalToolExecutor());
   const openaiClient = useRef(new OpenAI({ baseURL: modelEndpoint, apiKey: 'dummy' }));
@@ -469,7 +470,7 @@ const ChatInterface: React.FC<{
     conversationHistory.current.push({ role: 'user', content: userInput });
     turnMessages.current = [{ role: 'user', content: userInput }];
 
-    // No periodic re-renders; we stream directly to stdout.
+    // Render incrementally but keep React in control of the output region.
 
     try { // Wrap main logic in try/finally to ensure cleanup
       const workspaceContents = await getRootDirectoryListing();
@@ -507,12 +508,7 @@ const ChatInterface: React.FC<{
 
         // Reset accumulator for each assistant streaming cycle
         accumulatedOutput = '';
-
-        // Print assistant header and a newline once before streaming tokens
-        try {
-          process.stdout.write("\n");
-          process.stdout.write("🤖 Fry:\n");
-        } catch {}
+        setLiveAssistantContent('');
 
         const builtinToolsKw: string[] = [];
         const stream = await (openaiClient.current.chat.completions as any).create({
@@ -551,17 +547,9 @@ const ChatInterface: React.FC<{
           if (delta.content) {
             const piece = delta.content;
             accumulatedOutput += piece;
-            try {
-              process.stdout.write(piece);
-            } catch {}
+            setLiveAssistantContent(accumulatedOutput);
           }
         }
-
-        // Ensure trailing newline after streaming content
-        try {
-          if (!accumulatedOutput.endsWith('\n')) process.stdout.write('\n');
-        } catch {}
-
         const assistantMessage: Message = { role: 'assistant' };
         if (accumulatedOutput.trim().length > 0) {
           assistantMessage.content = accumulatedOutput;
@@ -582,7 +570,18 @@ const ChatInterface: React.FC<{
         if (assistantMessage.tool_calls) assistantForLlm.tool_calls = assistantMessage.tool_calls;
         (messagesForLlm as any[]).push(assistantForLlm);
 
-        // Do not append content again; it was streamed above. Avoid double-printing.
+        if (accumulatedOutput.length > 0) {
+          appendTranscript(
+            <Box flexDirection="column" marginBottom={1}>
+              <Text color="green" bold>🤖 Fry:</Text>
+              <StreamingMarkdown content={accumulatedOutput} streaming={false} />
+            </Box>
+          );
+          lastBlockRef.current = 'assistant';
+        }
+        setLiveAssistantContent(null);
+
+        // Content already persisted; continue looping for tool calls if needed.
 
         if (isInterruptedRef.current) break;
 
@@ -620,11 +619,13 @@ const ChatInterface: React.FC<{
         }
       }
     } catch (error) {
+        setLiveAssistantContent(null);
         appendTranscript(<Text color="red">Error: {String(error)}</Text>);
     }
     // This finally block ensures the UI is always cleaned up correctly.
     finally {
       if (isInterruptedRef.current) {
+        setLiveAssistantContent(null);
         appendTranscript(<Text color="yellow">✗ Response interrupted by user.</Text>);
       }
 
@@ -712,7 +713,14 @@ const ChatInterface: React.FC<{
         )}
       </Static>
 
-      {/* No live area during streaming; we write directly to stdout. */}
+      {liveAssistantContent !== null && (
+        <Box flexDirection="column" marginTop={1} marginBottom={1}>
+          <Text color="green" bold>🤖 Fry:</Text>
+          {liveAssistantContent.length > 0 && (
+            <StreamingMarkdown content={liveAssistantContent} streaming />
+          )}
+        </Box>
+      )}
 
       {!isProcessing && (
         <ChatPrompt
