@@ -340,12 +340,70 @@ const StreamingMarkdown: React.FC<{ content: string; streaming?: boolean }> = ({
 
 const STREAMING_TAIL_THRESHOLD = 600;
 
-const hasOpenCodeFence = (text: string): boolean => {
-  const fences = text.match(/```/g);
-  return !!fences && (fences.length % 2 === 1);
+type CodeFenceContext = {
+  open: boolean;
+  language: string | null;
 };
 
-const computeFlushIndex = (fullText: string, flushedLength: number, final: boolean): number => {
+const defaultFenceContext = (): CodeFenceContext => ({ open: false, language: null });
+
+const advanceFenceContext = (segment: string, prev: CodeFenceContext): CodeFenceContext => {
+  if (!segment) return { ...prev };
+
+  let open = prev.open;
+  let language = prev.language;
+  const fencePattern = /```([^`\n]*)?/g;
+  let match: RegExpExecArray | null;
+
+  while ((match = fencePattern.exec(segment)) !== null) {
+    const idx = match.index;
+    const isEscaped = idx > 0 && segment[idx - 1] === '\\';
+    if (isEscaped) continue;
+
+    if (!open) {
+      open = true;
+      language = (match[1] || '').trim() || null;
+    } else {
+      open = false;
+      language = null;
+    }
+  }
+
+  return { open, language };
+};
+
+const renderSegmentWithContext = (
+  segment: string,
+  before: CodeFenceContext,
+  after: CodeFenceContext
+): string => {
+  if (!segment) return segment;
+
+  let output = segment;
+
+  const trimmedStart = output.trimStart();
+  const hasFenceAtStart = /^```/.test(trimmedStart);
+
+  if (before.open && !hasFenceAtStart) {
+    const fenceHeader = before.language ? '```' + before.language + '\n' : '```\n';
+    output = fenceHeader + output;
+  }
+
+  if (after.open) {
+    const needsNewline = output.length > 0 && !output.endsWith('\n');
+    const closingFence = (needsNewline ? '\n' : '') + '```\n';
+    output = output + closingFence;
+  }
+
+  return output;
+};
+
+const computeFlushIndex = (
+  fullText: string,
+  flushedLength: number,
+  final: boolean,
+  fenceContext: CodeFenceContext
+): number => {
   if (final) return fullText.length;
   const remaining = fullText.length - flushedLength;
   if (remaining <= STREAMING_TAIL_THRESHOLD) return flushedLength;
@@ -366,11 +424,15 @@ const computeFlushIndex = (fullText: string, flushedLength: number, final: boole
   let candidate = flushedLength + candidateOffset;
   if (candidate <= flushedLength) return flushedLength;
 
-  if (hasOpenCodeFence(fullText.slice(0, candidate))) {
+  const previewSegment = fullText.slice(flushedLength, candidate);
+  const previewContext = advanceFenceContext(previewSegment, fenceContext);
+
+  if (previewContext.open) {
     const rest = fullText.slice(candidate);
     const closing = rest.indexOf('```');
-    if (closing === -1) return flushedLength;
-    candidate += closing + 3;
+    if (closing !== -1 && closing < STREAMING_TAIL_THRESHOLD) {
+      candidate += closing + 3;
+    }
   }
 
   return Math.min(candidate, fullText.length);
@@ -560,20 +622,24 @@ const ChatInterface: React.FC<{
         let printedChunks = 0;
         setLiveAssistantContent('');
         setShowLiveAssistantHeader(true);
+        let fenceState = defaultFenceContext();
 
         const flushAssistantOutput = (final: boolean) => {
           let progressed = false;
           while (true) {
-            const targetIndex = computeFlushIndex(accumulatedOutput, flushedLength, final);
+            const targetIndex = computeFlushIndex(accumulatedOutput, flushedLength, final, fenceState);
             if (targetIndex <= flushedLength) break;
 
             const chunk = accumulatedOutput.slice(flushedLength, targetIndex);
             const isFirstChunk = printedChunks === 0;
             const isFinalChunk = final && targetIndex === accumulatedOutput.length;
 
+            const nextFenceState = advanceFenceContext(chunk, fenceState);
+            const renderedChunk = renderSegmentWithContext(chunk, fenceState, nextFenceState);
+
             appendTranscript(
               <AssistantChunk
-                markdown={chunk}
+                markdown={renderedChunk}
                 isFirst={isFirstChunk}
                 isFinal={isFinalChunk}
               />
@@ -585,15 +651,19 @@ const ChatInterface: React.FC<{
 
             if (isFirstChunk) setShowLiveAssistantHeader(false);
             if (isFinalChunk) lastBlockRef.current = 'assistant';
+
+            fenceState = nextFenceState;
           }
 
           const tail = accumulatedOutput.slice(flushedLength);
           if (final) {
             if (!progressed && tail.length > 0) {
               const isFirstChunk = printedChunks === 0;
+              const tailFenceState = advanceFenceContext(tail, fenceState);
+              const renderedTail = renderSegmentWithContext(tail, fenceState, tailFenceState);
               appendTranscript(
                 <AssistantChunk
-                  markdown={tail}
+                  markdown={renderedTail}
                   isFirst={isFirstChunk}
                   isFinal={true}
                 />
@@ -602,11 +672,14 @@ const ChatInterface: React.FC<{
               flushedLength = accumulatedOutput.length;
               lastBlockRef.current = 'assistant';
               if (isFirstChunk) setShowLiveAssistantHeader(false);
+              fenceState = tailFenceState;
             }
             setLiveAssistantContent(null);
             setShowLiveAssistantHeader(true);
           } else {
-            setLiveAssistantContent(tail);
+            const tailFenceState = advanceFenceContext(tail, fenceState);
+            const renderedTail = renderSegmentWithContext(tail, fenceState, tailFenceState);
+            setLiveAssistantContent(renderedTail);
           }
         };
 
