@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // client.tsx
 import React, { useState, useEffect, useRef } from 'react';
-import { render, Text, Box, useInput, useApp, Static } from 'ink';
+import { render, Text, Box, useInput, useApp, useStdout } from 'ink';
 import Gradient from 'ink-gradient';
 import SelectInput from 'ink-select-input';
 import { OpenAI } from 'openai/index.mjs';
@@ -16,8 +16,6 @@ import { spawnSync } from 'child_process';
 import * as fsSync from 'fs';
 import { fileURLToPath } from 'url';
 import { readFile } from 'fs/promises';
-import { marked } from 'marked';
-import { markedTerminal } from 'marked-terminal';
 
 // ===== Helpers: directory listing (workspace snapshot) =====
 async function getRootDirectoryListing(maxChars: number = 4000): Promise<string> {
@@ -150,15 +148,6 @@ async function maybeSelfUpdate(opts?: { skip?: boolean, timeoutMs?: number }) {
     // swallow
   }
 }
-
-// ===== Markdown renderer (terminal) =====
-marked.use(markedTerminal({
-  // Preserve model formatting as much as possible: avoid reflowing/wrapping text.
-  width: process.stdout.columns || 80,
-  reflowText: false,
-  unescape: true,
-  breaks: true,
-}));
 
 // ===== Types =====
 interface SessionData { session_id: string; tier: 'local'; }
@@ -313,142 +302,7 @@ const clearTerminalOutput = () => {
   process.stdout.write('\u001B[3J\u001B[2J\u001B[H');
 };
 
-// ===== Small UI bits =====
-const LoadingIndicator: React.FC<{ text: string }> = ({ text }) => (
-  <Box><Text color="cyan">{text}</Text></Box>
-);
-
-// Synchronous Markdown renderer designed to work both for live streaming
-// (optionally buffers unclosed code fences) and finalized transcript items.
-const StreamingMarkdown: React.FC<{ content: string; streaming?: boolean }> = ({ content, streaming }) => {
-  // Compute synchronously so content persists when flushed by <Static />.
-  let toRender = content || '';
-  try {
-    if (streaming && toRender) {
-      // If there's an odd number of ``` fences, temporarily close the block
-      // to avoid broken formatting during streaming.
-      const fences = toRender.match(/```/g) || [];
-      const isCodeBlockOpen = fences.length % 2 !== 0;
-      if (isCodeBlockOpen) toRender = toRender + '\n```';
-    }
-    toRender = marked(toRender) as unknown as string;
-  } catch {
-    // Fallback to raw content on parsing error
-  }
-  return <Text>{toRender}</Text>;
-};
-
-const STREAMING_TAIL_THRESHOLD = 600;
-
-type CodeFenceContext = {
-  open: boolean;
-  language: string | null;
-};
-
-const defaultFenceContext = (): CodeFenceContext => ({ open: false, language: null });
-
-const advanceFenceContext = (segment: string, prev: CodeFenceContext): CodeFenceContext => {
-  if (!segment) return { ...prev };
-
-  let open = prev.open;
-  let language = prev.language;
-  const fencePattern = /```([^`\n]*)?/g;
-  let match: RegExpExecArray | null;
-
-  while ((match = fencePattern.exec(segment)) !== null) {
-    const idx = match.index;
-    const isEscaped = idx > 0 && segment[idx - 1] === '\\';
-    if (isEscaped) continue;
-
-    if (!open) {
-      open = true;
-      language = (match[1] || '').trim() || null;
-    } else {
-      open = false;
-      language = null;
-    }
-  }
-
-  return { open, language };
-};
-
-const renderSegmentWithContext = (
-  segment: string,
-  before: CodeFenceContext,
-  after: CodeFenceContext
-): string => {
-  if (!segment) return segment;
-
-  let output = segment;
-
-  const trimmedStart = output.trimStart();
-  const hasFenceAtStart = /^```/.test(trimmedStart);
-
-  if (before.open && !hasFenceAtStart) {
-    const fenceHeader = before.language ? '```' + before.language + '\n' : '```\n';
-    output = fenceHeader + output;
-  }
-
-  if (after.open) {
-    const needsNewline = output.length > 0 && !output.endsWith('\n');
-    const closingFence = (needsNewline ? '\n' : '') + '```\n';
-    output = output + closingFence;
-  }
-
-  return output;
-};
-
-const computeFlushIndex = (
-  fullText: string,
-  flushedLength: number,
-  final: boolean,
-  fenceContext: CodeFenceContext
-): number => {
-  if (final) return fullText.length;
-  const remaining = fullText.length - flushedLength;
-  if (remaining <= STREAMING_TAIL_THRESHOLD) return flushedLength;
-
-  const slice = fullText.slice(flushedLength);
-  const flushTarget = remaining - STREAMING_TAIL_THRESHOLD;
-  const window = slice.slice(0, flushTarget);
-
-  let candidateOffset = flushTarget;
-  const windowNewline = window.lastIndexOf('\n');
-  if (windowNewline !== -1) {
-    candidateOffset = windowNewline + 1;
-  } else {
-    const windowSpace = window.lastIndexOf(' ');
-    if (windowSpace !== -1) candidateOffset = windowSpace + 1;
-  }
-
-  let candidate = flushedLength + candidateOffset;
-  if (candidate <= flushedLength) return flushedLength;
-
-  const previewSegment = fullText.slice(flushedLength, candidate);
-  const previewContext = advanceFenceContext(previewSegment, fenceContext);
-
-  if (previewContext.open) {
-    const rest = fullText.slice(candidate);
-    const closing = rest.indexOf('```');
-    if (closing !== -1 && closing < STREAMING_TAIL_THRESHOLD) {
-      candidate += closing + 3;
-    }
-  }
-
-  return Math.min(candidate, fullText.length);
-};
-
-const AssistantChunk: React.FC<{ markdown: string; isFirst: boolean; isFinal: boolean; }> = ({ markdown, isFirst, isFinal }) => (
-  <Box flexDirection="column" marginBottom={isFinal ? 1 : 0}>
-    {isFirst && <Text color="green" bold>🤖 Fry:</Text>}
-    <Box marginLeft={isFirst ? 0 : 2}>
-      <StreamingMarkdown content={markdown} streaming={false} />
-    </Box>
-  </Box>
-);
-
 // ===== Chat Component =====
-type TranscriptItem = React.ReactNode;
 
 const ChatInterface: React.FC<{
   sessionData: SessionData;
@@ -456,47 +310,49 @@ const ChatInterface: React.FC<{
   modelName: string;
   onResetSession: (data: SessionData) => void;
   streamIntervalMs: number;
-}> = ({ sessionData, modelEndpoint, modelName, onResetSession, streamIntervalMs }) => {
+}> = ({ sessionData, modelEndpoint, modelName, onResetSession, streamIntervalMs: _streamIntervalMs }) => {
   const { exit } = useApp();
-  // Let Ink manage raw mode internally for better Windows compatibility
+  const { stdout } = useStdout();
+
+  void _streamIntervalMs;
+
+  const stdoutRef = useRef(stdout);
+  useEffect(() => {
+    stdoutRef.current = stdout;
+  }, [stdout]);
 
   const [input, setInput] = useState('');
-  const [staticItems, setStaticItems] = useState<TranscriptItem[]>([]);
   const [isProcessing, setIsProcessing] = useState(false);
-  const [liveAssistantContent, setLiveAssistantContent] = useState<string | null>(null);
-  const [showLiveAssistantHeader, setShowLiveAssistantHeader] = useState(true);
   const isInterruptedRef = useRef(false);
-  // Stream via React state so the terminal isn't cleared/redrawn wholesale.
+  const clearedNoticeRef = useRef(false);
 
   const localExecutor = useRef(new LocalToolExecutor());
   const openaiClient = useRef(new OpenAI({ baseURL: modelEndpoint, apiKey: 'dummy' }));
   const conversationHistory = useRef<Message[]>([]);
   const turnMessages = useRef<Message[]>([]);
 
-  const appendTranscript = (node: TranscriptItem) => setStaticItems(prev => [...prev, node]);
-  const lastBlockRef = useRef<'assistant' | 'tool' | 'user' | 'system' | 'other' | null>(null);
-
   useEffect(() => {
-    appendTranscript(
-      <Box marginBottom={1}>
-        <Text color="cyan" bold>FryCLI</Text>
-        <Text> | Session: {sessionData.session_id.substring(0, 8)}... | </Text>
-        <Text color={'green'} bold>
-          {sessionData.tier.toUpperCase()}
-        </Text>
-      </Box>
-    );
-    appendTranscript(<Text dimColor>Working directory: {process.cwd()}</Text>);
-    lastBlockRef.current = 'system';
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    if (!stdoutRef.current) return;
+    stdoutRef.current.write(`\nFryCLI | Session: ${sessionData.session_id.substring(0, 8)}... | ${sessionData.tier.toUpperCase()}\n`);
+    stdoutRef.current.write(`Working directory: ${process.cwd()}\n`);
+    if (clearedNoticeRef.current) {
+      stdoutRef.current.write('History cleared. New session started.\n');
+      clearedNoticeRef.current = false;
+    }
+  }, [sessionData]);
 
-  // Avoid manually toggling raw mode; fixes input echo on PowerShell
+  const write = (text: string) => {
+    if (!stdoutRef.current) return;
+    stdoutRef.current.write(text);
+  };
+
+  const writeLine = (text: string) => {
+    write(text.endsWith('\n') ? text : `${text}\n`);
+  };
 
   const executeToolCall = async (toolCall: ToolCall): Promise<ToolResult> => {
     const toolName = toolCall.function.name;
 
-    // Show tool header
     let argsStr = '...';
     try {
       const argsObj = JSON.parse(toolCall.function.arguments || '{}');
@@ -507,18 +363,19 @@ const ChatInterface: React.FC<{
         })
         .join(', ');
     } catch {}
-    appendTranscript(
-      <Box>
-        <Text color="yellow">🔧 Executing: </Text>
-        <Text color="cyan" bold>{toolName}({argsStr})</Text>
-      </Box>
-    );
-    lastBlockRef.current = 'tool';
 
-    // Execute locally only
+    writeLine(`\n🔧 Executing: ${toolName}(${argsStr})`);
+
     let result: ToolResult;
     try {
-      if (toolName === 'workspace' || toolName === 'exec' || toolName.startsWith('fs.') || toolName === 'python' || toolName === 'shell' || toolName === 'apply_patch') {
+      if (
+        toolName === 'workspace' ||
+        toolName === 'exec' ||
+        toolName.startsWith('fs.') ||
+        toolName === 'python' ||
+        toolName === 'shell' ||
+        toolName === 'apply_patch'
+      ) {
         result = await localExecutor.current.execute(toolCall);
       } else {
         result = { status: 'error', data: `Unknown or unsupported tool: ${toolName}` } as ToolResult;
@@ -527,13 +384,12 @@ const ChatInterface: React.FC<{
       result = { status: 'error', data: `Tool failed: ${error?.message || String(error)}` };
     }
 
-    // Render result and also normalize what we send back to the model.
     const resultRaw: any = result?.data;
     let resultText: string;
 
-    // Detect a generic pagination envelope: { content: string, page, total_pages, ... }
     const isPaginated = (
-      result && result.status === 'success' &&
+      result &&
+      result.status === 'success' &&
       resultRaw && typeof resultRaw === 'object' && typeof (resultRaw as any).content === 'string' &&
       Number.isFinite((resultRaw as any).page) && Number.isFinite((resultRaw as any).total_pages)
     );
@@ -545,7 +401,6 @@ const ChatInterface: React.FC<{
       'path' in resultRaw &&
       'content' in resultRaw
     ) {
-      // File read (line-ranged) formatting
       const { path, content, start_line, end_line, total_lines, has_more } = resultRaw as any;
       const header = `--- Reading ${path} (lines ${start_line}-${end_line} of ${total_lines}) ---`;
       const footer = has_more ? `--- (more lines available) ---` : `--- (end of file) ---`;
@@ -555,34 +410,28 @@ const ChatInterface: React.FC<{
       const header = `--- Page ${page}/${total_pages} (page_size=${page_size}, total_chars=${total_chars}) ---`;
       resultText = [header, (resultRaw as any).content].join('\n');
     } else {
-      // Fallback formatting
       resultText = typeof resultRaw === 'string' ? resultRaw : JSON.stringify(resultRaw, null, 2);
       if (resultText === undefined || resultText === null) {
         try { resultText = String(resultRaw ?? ''); } catch { resultText = ''; }
       }
     }
-    
+
     const indented = resultText.split('\n').map(l => `  ${l}`).join('\n');
-    appendTranscript(
-      <Box flexDirection="column" marginBottom={1}>
-        <Text dimColor>[{toolName}] {result.status}:</Text>
-        <Text>{indented}</Text>
-      </Box>
-    );
+    writeLine(`[${toolName}] ${result.status}:`);
+    writeLine(indented);
+    write('\n');
+
     return result;
   };
 
   const processChatTurn = async (userInput: string) => {
     setIsProcessing(true);
     isInterruptedRef.current = false;
-    let accumulatedOutput = ''; // Accumulator for the current streamed assistant message
 
     conversationHistory.current.push({ role: 'user', content: userInput });
     turnMessages.current = [{ role: 'user', content: userInput }];
 
-    // Render incrementally but keep React in control of the output region.
-
-    try { // Wrap main logic in try/finally to ensure cleanup
+    try {
       const workspaceContents = await getRootDirectoryListing();
       const includeFs = true;
       const includeExec = true;
@@ -612,75 +461,16 @@ const ChatInterface: React.FC<{
       ];
       const toolsForLlm = getLocalTools();
 
-      // === Stream assistant ===
       while (true) {
         if (isInterruptedRef.current) break;
 
-        // Reset accumulator for each assistant streaming cycle
-        accumulatedOutput = '';
-        let flushedLength = 0;
-        let printedChunks = 0;
-        setLiveAssistantContent('');
-        setShowLiveAssistantHeader(true);
-        let fenceState = defaultFenceContext();
+        let accumulatedOutput = '';
+        let headerPrinted = false;
 
-        const flushAssistantOutput = (final: boolean) => {
-          let progressed = false;
-          while (true) {
-            const targetIndex = computeFlushIndex(accumulatedOutput, flushedLength, final, fenceState);
-            if (targetIndex <= flushedLength) break;
-
-            const chunk = accumulatedOutput.slice(flushedLength, targetIndex);
-            const isFirstChunk = printedChunks === 0;
-            const isFinalChunk = final && targetIndex === accumulatedOutput.length;
-
-            const nextFenceState = advanceFenceContext(chunk, fenceState);
-            const renderedChunk = renderSegmentWithContext(chunk, fenceState, nextFenceState);
-
-            appendTranscript(
-              <AssistantChunk
-                markdown={renderedChunk}
-                isFirst={isFirstChunk}
-                isFinal={isFinalChunk}
-              />
-            );
-
-            flushedLength = targetIndex;
-            printedChunks += 1;
-            progressed = true;
-
-            if (isFirstChunk) setShowLiveAssistantHeader(false);
-            if (isFinalChunk) lastBlockRef.current = 'assistant';
-
-            fenceState = nextFenceState;
-          }
-
-          const tail = accumulatedOutput.slice(flushedLength);
-          if (final) {
-            if (!progressed && tail.length > 0) {
-              const isFirstChunk = printedChunks === 0;
-              const tailFenceState = advanceFenceContext(tail, fenceState);
-              const renderedTail = renderSegmentWithContext(tail, fenceState, tailFenceState);
-              appendTranscript(
-                <AssistantChunk
-                  markdown={renderedTail}
-                  isFirst={isFirstChunk}
-                  isFinal={true}
-                />
-              );
-              printedChunks += 1;
-              flushedLength = accumulatedOutput.length;
-              lastBlockRef.current = 'assistant';
-              if (isFirstChunk) setShowLiveAssistantHeader(false);
-              fenceState = tailFenceState;
-            }
-            setLiveAssistantContent(null);
-            setShowLiveAssistantHeader(true);
-          } else {
-            const tailFenceState = advanceFenceContext(tail, fenceState);
-            const renderedTail = renderSegmentWithContext(tail, fenceState, tailFenceState);
-            setLiveAssistantContent(renderedTail);
-          }
+        const ensureHeader = () => {
+          if (headerPrinted) return;
+          headerPrinted = true;
+          write('\n🤖 Fry:\n');
         };
 
         const builtinToolsKw: string[] = [];
@@ -695,7 +485,6 @@ const ChatInterface: React.FC<{
 
         const toolAssembler: Map<number, ToolCall> = new Map();
         const toolCalls: ToolCall[] = [];
-        // We skip live tool-call preview to avoid dynamic redraws.
 
         for await (const chunk of stream as AsyncIterable<StreamChunk>) {
           if (isInterruptedRef.current) break;
@@ -703,7 +492,6 @@ const ChatInterface: React.FC<{
           const delta = chunk.choices?.[0]?.delta;
           if (!delta) continue;
 
-          // Assemble tool_calls
           if (delta.tool_calls) {
             for (const tc of delta.tool_calls) {
               if (!toolAssembler.has(tc.index)) {
@@ -714,16 +502,20 @@ const ChatInterface: React.FC<{
               if (tc.function?.name && !acc.function.name) acc.function.name = tc.function.name;
               if (tc.function?.arguments) acc.function.arguments += tc.function.arguments;
             }
-            // Collect tool call chunks; no live preview to avoid redraws
           }
 
           if (delta.content) {
             const piece = delta.content;
             accumulatedOutput += piece;
-            flushAssistantOutput(false);
+            ensureHeader();
+            write(piece);
           }
         }
-        flushAssistantOutput(true);
+
+        if (headerPrinted && accumulatedOutput.length > 0 && !accumulatedOutput.endsWith('\n')) {
+          write('\n');
+        }
+
         const assistantMessage: Message = { role: 'assistant' };
         if (accumulatedOutput.trim().length > 0) {
           assistantMessage.content = accumulatedOutput;
@@ -744,15 +536,12 @@ const ChatInterface: React.FC<{
         if (assistantMessage.tool_calls) assistantForLlm.tool_calls = assistantMessage.tool_calls;
         (messagesForLlm as any[]).push(assistantForLlm);
 
-        // Content already persisted; continue looping for tool calls if needed.
-
         if (isInterruptedRef.current) break;
 
         if ((assistantMessage.tool_calls?.length || 0) === 0) break;
 
         for (const toolCall of assistantMessage.tool_calls || []) {
-        const result = await executeToolCall(toolCall);
-          // Normalize pagination for the model: send the page content as data, with meta sidecar
+          const result = await executeToolCall(toolCall);
           const rawData: any = result?.data;
           const looksPaginated = rawData && typeof rawData === 'object' && typeof rawData.content === 'string' && Number.isFinite(rawData.page) && Number.isFinite(rawData.total_pages);
           const payloadForModel = looksPaginated
@@ -782,27 +571,21 @@ const ChatInterface: React.FC<{
         }
       }
     } catch (error) {
-        setLiveAssistantContent(null);
-        appendTranscript(<Text color="red">Error: {String(error)}</Text>);
-    }
-    // This finally block ensures the UI is always cleaned up correctly.
-    finally {
+      writeLine(`\nError: ${String(error)}`);
+    } finally {
       if (isInterruptedRef.current) {
-        setLiveAssistantContent(null);
-        appendTranscript(<Text color="yellow">✗ Response interrupted by user.</Text>);
+        writeLine(`\n✗ Response interrupted by user.`);
+        isInterruptedRef.current = false;
       }
-
-      setShowLiveAssistantHeader(true);
       setIsProcessing(false);
     }
   };
 
   const handleSubmit = async (value: string) => {
     if (!value.trim()) return;
-    
+
     const userInput = value.trim();
     setInput('');
-    
 
     if (userInput.toLowerCase() === 'exit' || userInput.toLowerCase() === 'quit') {
       exit();
@@ -817,41 +600,19 @@ const ChatInterface: React.FC<{
         conversationHistory.current = [];
 
         clearTerminalOutput();
-        // Reset session metadata and transcript state after clearing the terminal
         const newSessionInfo: SessionData = { session_id: Math.random().toString(36).slice(2, 10), tier: 'local' };
+        clearedNoticeRef.current = true;
         onResetSession(newSessionInfo);
-        setStaticItems([]); // Clear the visual transcript
-        appendTranscript(
-          <Box marginBottom={1}>
-            <Text color="cyan" bold>FryCLI</Text>
-            <Text> | Session: {newSessionInfo.session_id.substring(0, 8)}... | </Text>
-            <Text color={'green'} bold>
-              {newSessionInfo.tier.toUpperCase()}
-            </Text>
-          </Box>
-        );
-        appendTranscript(
-          <Text dimColor>
-            Working directory: {process.cwd()}
-          </Text>
-        );
-        appendTranscript(<Text color="yellow">History cleared. New session started.</Text>);
-        lastBlockRef.current = 'system';
       } finally {
         setIsProcessing(false);
       }
       return;
     }
 
-    // Auth/dashboard/key commands removed in local-only mode
+    write('\n');
+    writeLine('👤 You:');
+    writeLine(userInput);
 
-    appendTranscript(
-      <Box flexDirection="column" marginBottom={1}>
-        <Text color="blue" bold>👤 You:</Text>
-        <Text>{userInput}</Text>
-      </Box>
-    );
-    lastBlockRef.current = 'user';
     await processChatTurn(userInput);
   };
 
@@ -859,7 +620,7 @@ const ChatInterface: React.FC<{
     if (key.escape) {
       exit();
     }
-    
+
     if (key.ctrl && (char || '').toLowerCase() === 'c') {
       if (isProcessing) {
         isInterruptedRef.current = true;
@@ -871,31 +632,18 @@ const ChatInterface: React.FC<{
 
   return (
     <Box flexDirection="column">
-      <Static items={staticItems}>
-        {(item, idx) => (
-          <Box key={idx}>{item}</Box>
-        )}
-      </Static>
-
-      {liveAssistantContent !== null && (
-        <Box flexDirection="column" marginTop={1} marginBottom={1}>
-          {showLiveAssistantHeader && <Text color="green" bold>🤖 Fry:</Text>}
-          {liveAssistantContent.length > 0 && (
-            <Box marginLeft={showLiveAssistantHeader ? 0 : 2}>
-              <StreamingMarkdown content={liveAssistantContent} streaming />
-            </Box>
-          )}
+      {isProcessing ? (
+        <Box marginTop={1}>
+          <Text color="cyan">Processing... (Ctrl+C to interrupt)</Text>
         </Box>
-      )}
-
-      {!isProcessing && (
+      ) : (
         <ChatPrompt
           value={input}
           onChange={setInput}
           onSubmit={handleSubmit}
         />
       )}
-  
+
       <Box marginTop={1} justifyContent="space-between">
         <Box flexDirection="column">
           <Text dimColor>Shift+Enter for newline, Enter to submit</Text>
@@ -1055,7 +803,7 @@ Options
 );
 
 (async () => {
-  await maybeSelfUpdate({ skip: !cli.flags.update });
+  //await maybeSelfUpdate({ skip: !cli.flags.update });
   const modelName = cli.flags.model || process.env.FRY_MODEL_NAME || 'llama';
 
   render(
