@@ -309,8 +309,7 @@ const ChatInterface: React.FC<{
   modelEndpoint: string;
   modelName: string;
   onResetSession: (data: SessionData) => void;
-  streamIntervalMs: number;
-}> = ({ sessionData, modelEndpoint, modelName, onResetSession, streamIntervalMs: _streamIntervalMs }) => {
+  
   const { exit } = useApp();
   const { stdout } = useStdout();
 
@@ -464,15 +463,6 @@ const ChatInterface: React.FC<{
       while (true) {
         if (isInterruptedRef.current) break;
 
-        let accumulatedOutput = '';
-        let headerPrinted = false;
-
-        const ensureHeader = () => {
-          if (headerPrinted) return;
-          headerPrinted = true;
-          write('\n🤖 Fry:\n');
-        };
-
         const builtinToolsKw: string[] = [];
         const stream = await (openaiClient.current.chat.completions as any).create({
           model: modelName,
@@ -507,14 +497,6 @@ const ChatInterface: React.FC<{
           if (delta.content) {
             const piece = delta.content;
             accumulatedOutput += piece;
-            ensureHeader();
-            write(piece);
-          }
-        }
-
-        if (headerPrinted && accumulatedOutput.length > 0 && !accumulatedOutput.endsWith('\n')) {
-          write('\n');
-        }
 
         const assistantMessage: Message = { role: 'assistant' };
         if (accumulatedOutput.trim().length > 0) {
@@ -571,12 +553,7 @@ const ChatInterface: React.FC<{
         }
       }
     } catch (error) {
-      writeLine(`\nError: ${String(error)}`);
-    } finally {
-      if (isInterruptedRef.current) {
-        writeLine(`\n✗ Response interrupted by user.`);
-        isInterruptedRef.current = false;
-      }
+
       setIsProcessing(false);
     }
   };
@@ -603,6 +580,7 @@ const ChatInterface: React.FC<{
         const newSessionInfo: SessionData = { session_id: Math.random().toString(36).slice(2, 10), tier: 'local' };
         clearedNoticeRef.current = true;
         onResetSession(newSessionInfo);
+
       } finally {
         setIsProcessing(false);
       }
@@ -632,11 +610,7 @@ const ChatInterface: React.FC<{
 
   return (
     <Box flexDirection="column">
-      {isProcessing ? (
-        <Box marginTop={1}>
-          <Text color="cyan">Processing... (Ctrl+C to interrupt)</Text>
-        </Box>
-      ) : (
+
         <ChatPrompt
           value={input}
           onChange={setInput}
@@ -744,7 +718,7 @@ const EndpointSelector: React.FC<{ onSelect: (url: string) => void }> = ({ onSel
   );
 };
 
-const App: React.FC<{ modelName: string; streamIntervalMs: number; }> = ({ modelName, streamIntervalMs }) => {
+const App: React.FC<{ modelName: string; }> = ({ modelName }) => {
   const [stage, setStage] = useState<'endpoint' | 'chat'>('endpoint');
   const [modelEndpoint, setModelEndpoint] = useState<string | null>(null);
   const [sessionData, setSessionData] = useState<SessionData | null>(null);
@@ -773,7 +747,6 @@ const App: React.FC<{ modelName: string; streamIntervalMs: number; }> = ({ model
           sessionData={sessionData}
           modelEndpoint={modelEndpoint}
           modelName={modelName}
-          streamIntervalMs={streamIntervalMs}
           onResetSession={(data) => {
             setSessionData(data);
           }}
@@ -807,7 +780,7 @@ Options
   const modelName = cli.flags.model || process.env.FRY_MODEL_NAME || 'llama';
 
   render(
-    <App modelName={modelName} streamIntervalMs={60} />,
+    <App modelName={modelName} />,
     { exitOnCtrlC: false }
   );
 })();
