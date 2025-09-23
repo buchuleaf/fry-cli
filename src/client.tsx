@@ -526,10 +526,14 @@ const ChatInterface: React.FC<{
           const result = await executeToolCall(toolCall);
           const rawData: any = result?.data;
           const looksPaginated = rawData && typeof rawData === 'object' && typeof rawData.content === 'string' && Number.isFinite(rawData.page) && Number.isFinite(rawData.total_pages);
+          const dataForModel = looksPaginated && rawData.total_pages > 1
+            ? `${rawData.content}\n\nNote: To view additional pages, call the "${toolCall.function.name}" tool again with the same arguments and set "page" to the desired page number.`
+            : rawData.content;
+
           const payloadForModel = looksPaginated
             ? {
                 status: result.status,
-                data: rawData.content,
+                data: dataForModel,
                 pagination: {
                   page: rawData.page,
                   page_size: rawData.page_size,
