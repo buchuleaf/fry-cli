@@ -185,7 +185,7 @@ const getLocalTools = () => {
       type: 'function',
       function: {
         name: 'exec',
-        description: "Execute code via a local runtime. Set runtime to 'shell' or 'python'. Returns labeled STDOUT/STDERR; large output is paginated.",
+        description: "Execute code via a local runtime. Set runtime to 'shell' or 'python'. Use this for tasks like text searching (no fs.search_files tool). Returns labeled STDOUT/STDERR; large output is paginated.",
         parameters: {
           type: 'object',
           properties: {
@@ -422,6 +422,7 @@ const ChatInterface: React.FC<{
         ? "\nFilesystem tools (fs.*): fs.ls, fs.read, fs.write, fs.mkdir, fs.apply_patch.\n" +
           "- Paths are relative to the current working directory.\n" +
           "- Use only relative paths, not absolute paths.\n" +
+          "- There is no fs.search_files tool; use the exec tool (runtime 'shell' or 'python') for searches and filtering.\n" +
           "- fs.read: returns up to 200 lines. Params: { path, start_line?, end_line? }. If end_line is omitted, returns 50 lines starting at start_line (default 1).\n" +
           "  The response includes metadata: { content, start_line, end_line, total_lines, has_more, next_start_line }.\n" +
           "- For multi-file edits, use fs.apply_patch with the pseudo-unified patch format bounded by '*** Begin Patch' and '*** End Patch'.\n"
@@ -429,6 +430,7 @@ const ChatInterface: React.FC<{
       const execGuidance = includeExec
         ? "\nExec tool: use { runtime: 'shell' | 'python' } to run local commands/code.\n" +
           "- Runs in the current working directory.\n" +
+          "- Use shell commands (e.g. rg/grep/find) or Python snippets via exec for any search or traversal tasks.\n" +
           "- Large outputs are paginated with metadata for navigation.\n"
         : '';
 

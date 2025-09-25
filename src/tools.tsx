@@ -349,6 +349,11 @@ export class LocalToolExecutor {
       case 'apply_patch_': // tolerate trailing underscore
       case '_apply_patch': // tolerate leading underscore
         return await this.handleApplyPatch(args);
+      case 'search_files':
+        return {
+          status: 'error',
+          data: "fs.search_files is unavailable. Use the 'exec' tool with runtime 'shell' (e.g. rg/grep/find) or runtime 'python' to search within files."
+        };
       default:
         return { status: 'error', data: `Unknown fs command: ${raw}` };
     }
