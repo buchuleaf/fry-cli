@@ -343,7 +343,7 @@ const ChatInterface: React.FC<{
         .join(', ');
     } catch {}
 
-    writeLine(`\n🔧 Executing: ${toolName}(${argsStr})`);
+    writeLine(`\n\n🔧 Executing: ${toolName}(${argsStr})`);
 
     let result: ToolResult;
     try {
