@@ -343,7 +343,7 @@ const ChatInterface: React.FC<{
         .join(', ');
     } catch {}
 
-    writeLine(`\n\n🔧 Executing: ${toolName}(${argsStr})`);
+    writeLine(`\n🔧 Executing: ${toolName}(${argsStr})`);
 
     let result: ToolResult;
     try {
@@ -507,7 +507,7 @@ const ChatInterface: React.FC<{
               }
 
               if (!display.headerShown) {
-                write('\n');
+                write('\n\n');
                 writeLine(`🔧 Tool call #${tc.index + 1}`);
                 display.headerShown = true;
               }
