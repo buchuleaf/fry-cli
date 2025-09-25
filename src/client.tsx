@@ -16,6 +16,8 @@ import { spawnSync } from 'child_process';
 import * as fsSync from 'fs';
 import { fileURLToPath } from 'url';
 import { readFile } from 'fs/promises';
+import { Marked } from 'marked';
+import TerminalRenderer from 'marked-terminal';
 
 // ===== Helpers: directory listing (workspace snapshot) =====
 async function getRootDirectoryListing(maxChars: number = 4000): Promise<string> {
@@ -284,6 +286,29 @@ const clearTerminalOutput = () => {
   process.stdout.write('\u001B[3J\u001B[2J\u001B[H');
 };
 
+const markdownParserCache = new Map<number, Marked>();
+
+const getMarkdownParser = (columns?: number) => {
+  const width = columns && Number.isFinite(columns) && columns > 0 ? columns : 80;
+  if (!markdownParserCache.has(width)) {
+    markdownParserCache.set(width, new Marked({
+      renderer: new TerminalRenderer({ width, reflowText: false, tab: 2 })
+    }));
+  }
+  return markdownParserCache.get(width)!;
+};
+
+const renderMarkdownToAnsi = (markdown: string, columns?: number): string => {
+  if (!markdown) return '';
+  try {
+    const parser = getMarkdownParser(columns);
+    const rendered = parser.parse(markdown, { async: false }) as string;
+    return typeof rendered === 'string' ? rendered : markdown;
+  } catch {
+    return markdown;
+  }
+};
+
 // ===== Chat Component =====
 
 const ChatInterface: React.FC<{
@@ -451,6 +476,9 @@ const ChatInterface: React.FC<{
 
         let accumulatedOutput = '';
         let headerPrinted = false;
+        const isStdoutTty = Boolean(stdoutRef.current && (stdoutRef.current as any).isTTY);
+        let hasStreamRendered = false;
+        let lastRenderedDisplay = '';
 
         const ensureHeader = () => {
           if (headerPrinted) return;
@@ -490,14 +518,57 @@ const ChatInterface: React.FC<{
           }
 
           if (delta.content) {
-            const piece = delta.content;
-            accumulatedOutput += piece;
+            accumulatedOutput += delta.content;
+
+            const columns = stdoutRef.current?.columns ?? process.stdout?.columns;
+            const rendered = renderMarkdownToAnsi(accumulatedOutput, columns);
+            const renderedForDisplay = rendered || accumulatedOutput;
+            const normalizedDisplay = renderedForDisplay.endsWith('\n')
+              ? renderedForDisplay
+              : `${renderedForDisplay}\n`;
+
+            if (!hasStreamRendered && normalizedDisplay.trim().length === 0) {
+              continue;
+            }
+
             ensureHeader();
-            write(piece);
+
+            if (isStdoutTty) {
+              if (!hasStreamRendered) {
+                write('\u001B[s');
+                write(normalizedDisplay);
+                hasStreamRendered = true;
+              } else if (normalizedDisplay !== lastRenderedDisplay) {
+                write('\u001B[u');
+                write('\u001B[s');
+                write('\u001B[J');
+                write(normalizedDisplay);
+              }
+            } else {
+              write(delta.content);
+              hasStreamRendered = true;
+            }
+
+            lastRenderedDisplay = normalizedDisplay;
           }
         }
 
-        if (headerPrinted && accumulatedOutput.length > 0 && !accumulatedOutput.endsWith('\n')) {
+        if (!hasStreamRendered && accumulatedOutput.length > 0) {
+          const columns = stdoutRef.current?.columns ?? process.stdout?.columns;
+          const rendered = renderMarkdownToAnsi(accumulatedOutput, columns);
+          const renderedForDisplay = rendered || accumulatedOutput;
+          if (renderedForDisplay.trim().length > 0) {
+            ensureHeader();
+            const normalizedDisplay = renderedForDisplay.endsWith('\n')
+              ? renderedForDisplay
+              : `${renderedForDisplay}\n`;
+            write(normalizedDisplay);
+            lastRenderedDisplay = normalizedDisplay;
+            hasStreamRendered = true;
+          }
+        }
+
+        if (!isStdoutTty && hasStreamRendered && !accumulatedOutput.endsWith('\n')) {
           write('\n');
         }
 
