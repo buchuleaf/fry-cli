@@ -403,9 +403,13 @@ const ChatInterface: React.FC<{
       const footer = has_more ? `--- (more lines available) ---` : `--- (end of file) ---`;
       resultText = [header, content, footer].join('\n');
     } else if (isPaginated) {
-      const { page, total_pages, page_size, total_chars } = resultRaw as any;
+      const { page, total_pages, page_size, total_chars, has_prev, has_next } = resultRaw as any;
       const header = `--- Page ${page}/${total_pages} (page_size=${page_size}, total_chars=${total_chars}) ---`;
-      resultText = [header, (resultRaw as any).content].join('\n');
+      const footerParts = [header];
+      if (has_prev || has_next) {
+        footerParts.push(`Note: To view additional pages, call "${toolName}" again with the same arguments and set "page" to the desired page number.`);
+      }
+      resultText = [header, (resultRaw as any).content, footerParts.join('\n')].join('\n');
     } else {
       resultText = typeof resultRaw === 'string' ? resultRaw : JSON.stringify(resultRaw, null, 2);
       if (resultText === undefined || resultText === null) {
