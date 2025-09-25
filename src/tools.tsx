@@ -2,7 +2,6 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { spawn } from 'child_process';
-import * as glob from 'glob';
 
 // Types
 export interface ToolCall {
@@ -78,115 +77,6 @@ export class LocalToolExecutor {
     };
   }
 
-  // Line-safe pagination: ensures each page ends on a full line boundary.
-  // Pages are constructed by packing as many complete lines as fit within pageSize chars.
-  private paginateOutputLineSafe(content: string, page: number, pageSize: number) {
-    const lines = content.split('\n');
-    const chunks: string[] = [];
-    let current: string[] = [];
-    let currentLen = 0;
-
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
-      // Length if we add this line. Add 1 char for the newline that existed between lines,
-      // except for the last line in the content which may not have a trailing newline.
-      const addLen = line.length + (i < lines.length - 1 ? 1 : 0);
-      if (currentLen > 0 && currentLen + addLen > pageSize) {
-        chunks.push(current.join('\n'));
-        current = [];
-        currentLen = 0;
-      }
-      current.push(line);
-      currentLen += addLen;
-    }
-    if (current.length > 0) {
-      chunks.push(current.join('\n'));
-    }
-
-    const totalChars = content.length;
-    const totalPages = Math.max(1, chunks.length);
-    const actualPage = Math.max(1, Math.min(page, totalPages));
-    const pageContent = chunks[actualPage - 1] ?? '';
-
-    return {
-      content: pageContent,
-      page: actualPage,
-      page_size: pageSize,
-      total_chars: totalChars,
-      total_pages: totalPages,
-      has_prev: actualPage > 1,
-      has_next: actualPage < totalPages,
-    };
-  }
-
-  private chunkText(text: string, rawPageSize: number): string[] {
-    const safeSize = Math.max(1, Math.floor(rawPageSize));
-    if (text.length <= safeSize) return [text];
-
-    const chunks: string[] = [];
-    for (let i = 0; i < text.length; i += safeSize) {
-      chunks.push(text.slice(i, i + safeSize));
-    }
-    return chunks;
-  }
-
-  private expandSearchMatch(
-    match: { path: string; line: number; text: string },
-    rawPageSize: number
-  ): string[] {
-    const safePageSize = Math.max(1, Math.floor(rawPageSize));
-    const lineText = match.text ?? '';
-    const basePrefix = `${match.path}:${match.line}`;
-    const firstPrefix = `${basePrefix}:`;
-    const fullLine = `${firstPrefix}${lineText}`;
-
-    if (fullLine.length <= safePageSize) {
-      return [fullLine];
-    }
-
-    // If even the prefix alone exceeds the page size, fall back to raw chunking.
-    if (firstPrefix.length >= safePageSize) {
-      return this.chunkText(fullLine, safePageSize);
-    }
-
-    const segments: string[] = [];
-    let remaining = lineText;
-
-    const maxFirstBody = safePageSize - firstPrefix.length;
-    const firstChunk = remaining.slice(0, maxFirstBody);
-    segments.push(`${firstPrefix}${firstChunk}`);
-    remaining = remaining.slice(firstChunk.length);
-
-    let continuationIndex = 2;
-    while (remaining.length > 0) {
-      const contPrefix = `${basePrefix} (cont ${continuationIndex}):`;
-      const available = safePageSize - contPrefix.length;
-
-      if (available <= 0) {
-        segments.push(...this.chunkText(`${contPrefix}${remaining}`, safePageSize));
-        break;
-      }
-
-      const chunk = remaining.slice(0, available);
-      segments.push(`${contPrefix}${chunk}`);
-      remaining = remaining.slice(chunk.length);
-      continuationIndex += 1;
-    }
-
-    return segments;
-  }
-
-  private expandSearchMatchesForPagination(
-    matches: Array<{ path: string; line: number; text: string }>,
-    pageSize: number
-  ): string[] {
-    const expanded: string[] = [];
-    for (const match of matches) {
-      expanded.push(...this.expandSearchMatch(match, pageSize));
-    }
-    return expanded;
-  }
-
   async execute(toolCall: ToolCall): Promise<ToolResult> {
     const functionName = toolCall.function.name;
     let args: any;
@@ -244,14 +134,6 @@ export class LocalToolExecutor {
         return this.handleWrite({ path: args.path, content: args.content });
       case 'mkdir':
         return this.handleMkdir({ path: args.path });
-      case 'search_files':
-        return this.handleSearchFiles({
-            pattern: args.pattern,
-            file_pattern: args.file_pattern,
-            path: args.path,
-            page: args.page,
-            page_size: args.page_size,
-        }, toolCallId);
       case 'apply_patch':
       case 'applypatch':
       case 'apply__patch':
@@ -261,7 +143,7 @@ export class LocalToolExecutor {
       // No 'read_chunk' action in simplified API
       // fallthrough
       default:
-        return { status: 'error', data: `Unknown or missing 'action'. Use one of: ls, read, write, mkdir, search_files, apply_patch. Received: '${actionRaw}'` };
+        return { status: 'error', data: `Unknown or missing 'action'. Use one of: ls, read, write, mkdir, apply_patch. Received: '${actionRaw}'` };
     }
   }
 
@@ -461,8 +343,6 @@ export class LocalToolExecutor {
         return await this.handleWrite(args);
       case 'mkdir':
         return await this.handleMkdir(args);
-      case 'search_files':
-        return await this.handleSearchFiles(args, toolCallId);
       case 'apply_patch':
       case 'applypatch': // tolerate missing underscore
       case 'apply__patch': // tolerate accidental double underscore
@@ -601,118 +481,6 @@ export class LocalToolExecutor {
       return { status: 'success', data: `Directory '${pathArg}' created.` };
     } catch (error) {
       return { status: 'error', data: `Error creating directory: ${error}` };
-    }
-  }
-
-  private async handleSearchFiles(args: any, toolCallId: string): Promise<ToolResult> {
-    const pattern = args.pattern;
-    if (!pattern) return { status: 'error', data: 'Missing pattern argument.' };
-
-    const page = Math.max(1, parseInt(args.page) || 1);
-    const pageSize = Math.min(5000, Math.max(1, parseInt(args.page_size) || 2000));
-
-    // Optional base path to scope the search. Defaults to workspace root.
-    const pathArg = args.path;
-    const filePattern = args.file_pattern || '**/*';
-
-    try {
-      let files: string[] = [];
-
-      // Resolve and validate the base path if provided.
-      if (pathArg) {
-        const safeBase = this.getSafePath(pathArg);
-        if (!safeBase) return { status: 'error', data: 'Access denied.' };
-        try {
-          const st = await fs.stat(safeBase);
-          if (st.isFile()) {
-            // If a single file is provided, search only that file.
-            files = [safeBase];
-          } else if (st.isDirectory()) {
-            // Search within the specified directory using the provided file pattern.
-            files = await glob.glob(filePattern, {
-              cwd: safeBase,
-              absolute: true,
-              ignore: [
-                '**/node_modules/**',
-                '**/.git/**',
-                '**/*.{jpg,jpeg,png,gif,bmp,ico,pdf,zip,gz,tar,rar,7z,exe,dll,so,o,a,class,pyc,mp3,mp4,mov,avi,wav,db,sqlite,sqlite3,dat,bin}',
-              ],
-              nodir: true,
-            });
-          } else {
-            return { status: 'error', data: 'Path is neither file nor directory.' };
-          }
-        } catch {
-          return { status: 'error', data: 'Path not found.' };
-        }
-      } else {
-        // No base path provided: search from the workspace root.
-        files = await glob.glob(filePattern, {
-          cwd: this.workspaceDir,
-          absolute: true,
-          ignore: [
-            '**/node_modules/**',
-            '**/.git/**',
-            '**/*.{jpg,jpeg,png,gif,bmp,ico,pdf,zip,gz,tar,rar,7z,exe,dll,so,o,a,class,pyc,mp3,mp4,mov,avi,wav,db,sqlite,sqlite3,dat,bin}',
-          ],
-          nodir: true,
-        });
-      }
-
-      const matches: Array<{ path: string; line: number; text: string }> = [];
-
-      // Layer 2: For remaining files, perform a content-based check for binary data.
-      // This helper function reads the first 1KB of a file and checks for a NULL byte.
-      const isFileBinary = async (filePath: string): Promise<boolean> => {
-        const chunk = Buffer.alloc(1024);
-        let fileHandle;
-        try {
-          fileHandle = await fs.open(filePath, 'r');
-          const { bytesRead } = await fileHandle.read(chunk, 0, 1024, 0);
-          await fileHandle.close(); // Close the handle immediately after reading.
-          
-          // A NULL byte (0x00) is a very strong indicator of a binary file.
-          return chunk.slice(0, bytesRead).includes(0);
-        } catch (err) {
-          // If we can't open or read the file, treat it as unsearchable/binary to be safe.
-          return true;
-        }
-      };
-
-      for (const file of files) {
-        try {
-          // Perform the content check as a final safeguard.
-          if (await isFileBinary(file)) {
-            continue; // Skip files that appear to be binary.
-          }
-
-          // If the file is not binary, proceed with reading and searching.
-          const content = await fs.readFile(file, 'utf-8');
-          const lines = content.split('\n');
-          
-          const relativePath = path.relative(this.workspaceDir, file);
-          lines.forEach((line, i) => {
-            if (line.includes(pattern)) {
-              matches.push({ path: relativePath, line: i + 1, text: line.trim() });
-            }
-          });
-        } catch {
-          // Silently skip any other files that can't be read.
-        }
-      }
-
-      if (matches.length === 0) {
-        return { status: 'success', data: `No matches found for '${pattern}'.` };
-      }
-
-      const expandedMatches = this.expandSearchMatchesForPagination(matches, pageSize);
-      const fullOutput = expandedMatches.join('\n');
-      // Use line-safe pagination so the last line in each page is complete
-      const paginated = this.paginateOutputLineSafe(fullOutput, page, pageSize);
-
-      return { status: 'success', data: paginated };
-    } catch (error) {
-      return { status: 'error', data: `Error during file search: ${error}` };
     }
   }
 

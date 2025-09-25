@@ -260,24 +260,6 @@ const getLocalTools = () => {
     {
       type: 'function',
       function: {
-        name: 'fs.search_files',
-        description: "Search for a substring across text files. Returns 'path:line:match' lines. Large result sets are paginated.",
-        parameters: {
-          type: 'object',
-          properties: {
-            pattern: { type: 'string', description: 'Substring to match (case-sensitive).' },
-            file_pattern: { type: 'string', description: "Glob of files to include (default '**/*')." },
-            path: { type: 'string', description: 'Optional base directory to scope the search (relative).' },
-            page: { type: 'integer', description: 'Page number to retrieve (1-indexed). Defaults to 1.' },
-            page_size: { type: 'integer', description: 'Number of matches per page. Defaults to 50, max 100.' }
-          },
-          required: ['pattern']
-        }
-      }
-    },
-    {
-      type: 'function',
-      function: {
         name: 'fs.apply_patch',
         description: "Apply multi-file edits using the pseudo-unified patch format bounded by '*** Begin Patch' and '*** End Patch'.",
         parameters: {
@@ -437,7 +419,7 @@ const ChatInterface: React.FC<{
       const includeFs = true;
       const includeExec = true;
       const fsGuidance = includeFs
-        ? "\nFilesystem tools (fs.*): fs.ls, fs.read, fs.write, fs.mkdir, fs.search_files, fs.apply_patch.\n" +
+        ? "\nFilesystem tools (fs.*): fs.ls, fs.read, fs.write, fs.mkdir, fs.apply_patch.\n" +
           "- Paths are relative to the current working directory.\n" +
           "- Use only relative paths, not absolute paths.\n" +
           "- fs.read: returns up to 200 lines. Params: { path, start_line?, end_line? }. If end_line is omitted, returns 50 lines starting at start_line (default 1).\n" +
