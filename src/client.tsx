@@ -469,6 +469,14 @@ const ChatInterface: React.FC<{
         });
 
         const toolAssembler: Map<number, ToolCall> = new Map();
+        type ToolDisplayState = {
+          headerShown: boolean;
+          id?: string;
+          name?: string;
+          argsLabelShown: boolean;
+          lastChunkEndedWithNewline: boolean;
+        };
+        const toolDisplayState: Map<number, ToolDisplayState> = new Map();
         const toolCalls: ToolCall[] = [];
 
         for await (const chunk of stream as AsyncIterable<StreamChunk>) {
@@ -478,6 +486,7 @@ const ChatInterface: React.FC<{
           if (!delta) continue;
 
           if (delta.tool_calls) {
+            ensureHeader();
             for (const tc of delta.tool_calls) {
               if (!toolAssembler.has(tc.index)) {
                 toolAssembler.set(tc.index, { id: '', type: 'function', function: { name: '', arguments: '' } });
@@ -486,6 +495,38 @@ const ChatInterface: React.FC<{
               if (tc.id) acc.id = tc.id;
               if (tc.function?.name && !acc.function.name) acc.function.name = tc.function.name;
               if (tc.function?.arguments) acc.function.arguments += tc.function.arguments;
+
+              let display = toolDisplayState.get(tc.index);
+              if (!display) {
+                display = {
+                  headerShown: false,
+                  argsLabelShown: false,
+                  lastChunkEndedWithNewline: false,
+                };
+                toolDisplayState.set(tc.index, display);
+              }
+
+              if (!display.headerShown) {
+                write('\n');
+                writeLine(`🔧 Tool call #${tc.index + 1}`);
+                display.headerShown = true;
+              }
+              if (tc.id && tc.id !== display.id) {
+                display.id = tc.id;
+                writeLine(`  id: ${tc.id}`);
+              }
+              if (tc.function?.name && tc.function.name !== display.name) {
+                display.name = tc.function.name;
+                writeLine(`  name: ${tc.function.name}`);
+              }
+              if (typeof tc.function?.arguments === 'string' && tc.function.arguments.length > 0) {
+                if (!display.argsLabelShown) {
+                  write('  arguments: ');
+                  display.argsLabelShown = true;
+                }
+                write(tc.function.arguments);
+                display.lastChunkEndedWithNewline = tc.function.arguments.endsWith('\n');
+              }
             }
           }
 
@@ -496,6 +537,13 @@ const ChatInterface: React.FC<{
             write(piece);
           }
         }
+
+        toolDisplayState.forEach((state) => {
+          if (state.argsLabelShown && !state.lastChunkEndedWithNewline) {
+            write('\n');
+            state.lastChunkEndedWithNewline = true;
+          }
+        });
 
         if (headerPrinted && accumulatedOutput.length > 0 && !accumulatedOutput.endsWith('\n')) {
           write('\n');
