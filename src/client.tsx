@@ -2,6 +2,7 @@
 // client.tsx
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { render, Text, Box, useInput, useApp, useStdout } from 'ink';
+import { format } from 'node:util';
 import Gradient from 'ink-gradient';
 import SelectInput from 'ink-select-input';
 import { OpenAI } from 'openai/index.mjs';
@@ -289,6 +290,38 @@ const ChatInterface: React.FC<{
   const appendLog = useCallback((content: string) => {
     (stdout ?? process.stdout).write(content);
   }, [stdout]);
+
+  useEffect(() => {
+    const originalConsole = {
+      log: console.log,
+      info: console.info,
+      warn: console.warn,
+      error: console.error,
+      debug: console.debug,
+    };
+
+    const wrap = <T extends (...args: any[]) => void>(original: T): T => {
+      const wrapped = ((...args: Parameters<T>) => {
+        const text = format(...args);
+        appendLog(text.endsWith('\n') ? text : `${text}\n`);
+      }) as T;
+      return wrapped;
+    };
+
+    console.log = wrap(originalConsole.log);
+    console.info = wrap(originalConsole.info);
+    console.warn = wrap(originalConsole.warn);
+    console.error = wrap(originalConsole.error);
+    console.debug = wrap(originalConsole.debug);
+
+    return () => {
+      console.log = originalConsole.log;
+      console.info = originalConsole.info;
+      console.warn = originalConsole.warn;
+      console.error = originalConsole.error;
+      console.debug = originalConsole.debug;
+    };
+  }, [appendLog]);
 
   const [input, setInput] = useState('');
   const [isProcessing, setIsProcessing] = useState(false);
