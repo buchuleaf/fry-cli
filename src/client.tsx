@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // client.tsx
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { render, Text, Box, useInput, useApp, useStdout } from 'ink';
+import { render, Text, Box, useInput, useApp, useStdout, Static } from 'ink';
 import { format } from 'node:util';
 import Gradient from 'ink-gradient';
 import SelectInput from 'ink-select-input';
@@ -19,6 +19,25 @@ import { fileURLToPath } from 'url';
 import { readFile } from 'fs/promises';
 import { Marked } from 'marked';
 import TerminalRenderer from 'marked-terminal';
+
+function renderMarkdownToAnsi(markdown: string, columns?: number): string {
+  if (!markdown) return '';
+
+  try {
+    const marked = new Marked();
+    marked.use({
+      renderer: new TerminalRenderer({
+        width: columns,
+        reflowText: true
+      }) as any
+    });
+
+    const output = marked.parse(markdown);
+    return typeof output === 'string' ? output : String(output ?? markdown);
+  } catch (error) {
+    return markdown;
+  }
+}
 
 // ===== Helpers: directory listing (workspace snapshot) =====
 async function getRootDirectoryListing(maxChars: number = 4000): Promise<string> {
@@ -181,6 +200,34 @@ type StreamChunk = {
   choices?: ChoiceDelta[];
 };
 
+type LogEntry = {
+  id: string;
+  content: string;
+};
+
+type ToolDisplayAccumulator = {
+  id?: string;
+  name?: string;
+  args: string;
+};
+
+function formatToolDisplay(index: number, data: ToolDisplayAccumulator): string {
+  const lines: string[] = [`🔧 Tool call #${index + 1}`];
+  if (data.id) {
+    lines.push(`  id: ${data.id}`);
+  }
+  if (data.name) {
+    lines.push(`  name: ${data.name}`);
+  }
+  if (data.args.trim().length > 0) {
+    lines.push('  arguments:');
+    for (const argLine of data.args.split('\n')) {
+      lines.push(`    ${argLine}`);
+    }
+  }
+  return lines.join('\n');
+}
+
 // ===== Local tool definitions (exec + fs.*) =====
 const getLocalTools = () => {
   const tools: any[] = [
@@ -288,10 +335,16 @@ const ChatInterface: React.FC<{
 }> = ({ sessionData, modelEndpoint, modelName, onResetSession }) => {
   const { exit } = useApp();
   const { stdout } = useStdout();
+  const logIdRef = useRef(0);
+  const [logEntries, setLogEntries] = useState<LogEntry[]>([]);
+  const [activeStream, setActiveStream] = useState<{ content: string } | null>(null);
+  const [transientToolDisplays, setTransientToolDisplays] = useState<Array<{ id: string; content: string }>>([]);
 
   const appendLog = useCallback((content: string) => {
-    (stdout ?? process.stdout).write(content);
-  }, [stdout]);
+    const id = `log-${logIdRef.current++}`;
+    const normalized = content.endsWith('\n') ? content : `${content}\n`;
+    setLogEntries(prev => [...prev, { id, content: normalized }]);
+  }, []);
 
   useEffect(() => {
     const originalConsole = {
@@ -468,16 +521,10 @@ const ChatInterface: React.FC<{
 
         let accumulatedOutput = '';
         let headerPrinted = false;
-        const isStdoutTty = Boolean(stdoutRef.current && (stdoutRef.current as any).isTTY);
         let hasStreamRendered = false;
-        let lastRenderedDisplay = '';
 
-        const ensureHeader = () => {
-          if (!headerPrinted) {
-            headerPrinted = true;
-            appendLog('\n🤖 Fry:\n');
-          }
-        };
+        setActiveStream(null);
+        setTransientToolDisplays([]);
 
         const builtinToolsKw: string[] = [];
         const stream = await (openaiClient.current.chat.completions as any).create({
@@ -490,15 +537,20 @@ const ChatInterface: React.FC<{
         });
 
         const toolAssembler: Map<number, ToolCall> = new Map();
-        type ToolDisplayState = {
-          headerShown: boolean;
-          id?: string;
-          name?: string;
-          argsLabelShown: boolean;
-          lastChunkEndedWithNewline: boolean;
-        };
-        const toolDisplayState: Map<number, ToolDisplayState> = new Map();
+        const toolDisplayBuffer: Map<number, ToolDisplayAccumulator> = new Map();
         const toolCalls: ToolCall[] = [];
+
+        const syncTransientToolDisplays = () => {
+          if (toolDisplayBuffer.size === 0) {
+            setTransientToolDisplays([]);
+            return;
+          }
+          const displays = Array.from(toolDisplayBuffer.entries()).map(([index, data]) => ({
+            id: `tool-${index}`,
+            content: formatToolDisplay(index, data)
+          }));
+          setTransientToolDisplays(displays);
+        };
 
         for await (const chunk of stream as AsyncIterable<StreamChunk>) {
           if (isInterruptedRef.current) break;
@@ -516,45 +568,24 @@ const ChatInterface: React.FC<{
               if (tc.function?.name && !acc.function.name) acc.function.name = tc.function.name;
               if (tc.function?.arguments) acc.function.arguments += tc.function.arguments;
 
-              let display = toolDisplayState.get(tc.index);
+              let display = toolDisplayBuffer.get(tc.index);
               if (!display) {
-                display = {
-                  headerShown: false,
-                  argsLabelShown: false,
-                  lastChunkEndedWithNewline: false,
-                };
-                toolDisplayState.set(tc.index, display);
+                display = { args: '' };
+                toolDisplayBuffer.set(tc.index, display);
               }
-
-              ensureHeader();
-
-              if (!display.headerShown) {
-                appendLog(`\n\n🔧 Tool call #${tc.index + 1}\n`);
-                display.headerShown = true;
-              }
-              if (tc.id && tc.id !== display.id) {
-                display.id = tc.id;
-                appendLog(`  id: ${tc.id}\n`);
-              }
-              if (tc.function?.name && tc.function.name !== display.name) {
-                display.name = tc.function.name;
-                appendLog(`  name: ${tc.function.name}\n`);
-              }
-              if (typeof tc.function?.arguments === 'string' && tc.function.arguments.length > 0) {
-                if (!display.argsLabelShown) {
-                  appendLog('  arguments: ');
-                  display.argsLabelShown = true;
-                }
-                appendLog(tc.function.arguments);
-                display.lastChunkEndedWithNewline = tc.function.arguments.endsWith('\n');
+              if (tc.id) display.id = tc.id;
+              if (tc.function?.name) display.name = tc.function.name;
+              if (typeof tc.function?.arguments === 'string') {
+                display.args += tc.function.arguments;
               }
             }
+            syncTransientToolDisplays();
           }
 
           if (delta.content) {
             accumulatedOutput += delta.content;
 
-            const columns = stdoutRef.current?.columns ?? process.stdout?.columns;
+            const columns = stdout?.columns ?? process.stdout?.columns;
             const rendered = renderMarkdownToAnsi(accumulatedOutput, columns);
             const renderedForDisplay = rendered || accumulatedOutput;
             const normalizedDisplay = renderedForDisplay.endsWith('\n')
@@ -565,35 +596,52 @@ const ChatInterface: React.FC<{
               continue;
             }
 
-            ensureHeader();
-
-            if (isStdoutTty) {
-              if (!hasStreamRendered) {
-                write('\u001B[s');
-                write(normalizedDisplay);
-                hasStreamRendered = true;
-              } else if (normalizedDisplay !== lastRenderedDisplay) {
-                write('\u001B[u');
-                write('\u001B[s');
-                write('\u001B[J');
-                write(normalizedDisplay);
-              }
-            } else {
-              write(delta.content);
-              hasStreamRendered = true;
+            if (!headerPrinted) {
+              headerPrinted = true;
+              setActiveStream(prev => prev ?? { content: '' });
             }
 
-            lastRenderedDisplay = normalizedDisplay;
+            setActiveStream(prev => (prev?.content === normalizedDisplay ? prev : { content: normalizedDisplay }));
+            hasStreamRendered = true;
           }
         }
 
         if (!hasStreamRendered && accumulatedOutput.length > 0) {
-          const columns = stdoutRef.current?.columns ?? process.stdout?.columns;
+          const columns = stdout?.columns ?? process.stdout?.columns;
           const rendered = renderMarkdownToAnsi(accumulatedOutput, columns);
           const renderedForDisplay = rendered || accumulatedOutput;
           if (renderedForDisplay.trim().length > 0) {
-            ensureHeader();
+            if (!headerPrinted) {
+              headerPrinted = true;
+              setActiveStream(prev => prev ?? { content: '' });
+            }
+            const normalizedFallback = renderedForDisplay.endsWith('\n')
+              ? renderedForDisplay
+              : `${renderedForDisplay}\n`;
+            setActiveStream(prev => (prev?.content === normalizedFallback ? prev : { content: normalizedFallback }));
+            hasStreamRendered = true;
+          }
         }
+
+        if (headerPrinted && accumulatedOutput.trim().length > 0) {
+          const columns = stdout?.columns ?? process.stdout?.columns;
+          const rendered = renderMarkdownToAnsi(accumulatedOutput, columns);
+          const renderedForDisplay = rendered || accumulatedOutput;
+          const normalizedFinal = renderedForDisplay.endsWith('\n')
+            ? renderedForDisplay
+            : `${renderedForDisplay}\n`;
+          appendLog(`\n🤖 Fry:\n${normalizedFinal}`);
+        }
+
+        if (toolDisplayBuffer.size > 0) {
+          for (const [index, data] of toolDisplayBuffer.entries()) {
+            const content = formatToolDisplay(index, data);
+            appendLog(`\n${content}\n`);
+          }
+        }
+
+        setActiveStream(null);
+        setTransientToolDisplays([]);
 
         const assistantMessage: Message = { role: 'assistant' };
         if (accumulatedOutput.trim().length > 0) {
@@ -656,6 +704,8 @@ const ChatInterface: React.FC<{
     } catch (error) {
       appendLog(`\nError: ${String(error)}\n`);
     } finally {
+      setActiveStream(null);
+      setTransientToolDisplays([]);
       if (isInterruptedRef.current) {
         appendLog(`\n✗ Response interrupted by user.\n`);
         isInterruptedRef.current = false;
@@ -711,6 +761,27 @@ const ChatInterface: React.FC<{
 
   return (
     <Box flexDirection="column">
+      <Static items={logEntries}>
+        {(entry) => (
+          <Box key={entry.id} flexDirection="column">
+            <Text>{entry.content}</Text>
+          </Box>
+        )}
+      </Static>
+
+      {activeStream && (
+        <Box flexDirection="column" marginTop={1}>
+          <Text color="green">🤖 Fry:</Text>
+          {activeStream.content && <Text>{activeStream.content}</Text>}
+        </Box>
+      )}
+
+      {transientToolDisplays.map(display => (
+        <Box key={display.id} marginTop={1} flexDirection="column">
+          <Text>{display.content}</Text>
+        </Box>
+      ))}
+
       {isProcessing ? (
         <Box>
           <Text color="cyan">Processing... (Ctrl+C to interrupt)</Text>
