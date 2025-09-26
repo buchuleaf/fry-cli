@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // client.tsx
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { render, Text, Box, useInput, useApp } from 'ink';
+import { render, Text, Box, useInput, useApp, useStdout } from 'ink';
 import Gradient from 'ink-gradient';
 import SelectInput from 'ink-select-input';
 import { OpenAI } from 'openai/index.mjs';
@@ -178,11 +178,6 @@ type StreamChunk = {
   choices?: ChoiceDelta[];
 };
 
-type LogEntry = {
-  id: string;
-  content: string;
-};
-
 // ===== Local tool definitions (exec + fs.*) =====
 const getLocalTools = () => {
   const tools: any[] = [
@@ -280,15 +275,6 @@ const getLocalTools = () => {
   return tools;
 };
 
-const clearTerminalOutput = () => {
-  console.clear();
-
-  if (!process.stdout.isTTY) return;
-
-  // Clear scrollback and move cursor to top-left for a clean slate
-  process.stdout.write('\u001B[3J\u001B[2J\u001B[H');
-};
-
 // ===== Chat Component =====
 
 const ChatInterface: React.FC<{
@@ -298,23 +284,11 @@ const ChatInterface: React.FC<{
   onResetSession: (data: SessionData) => void;
 }> = ({ sessionData, modelEndpoint, modelName, onResetSession }) => {
   const { exit } = useApp();
+  const { stdout } = useStdout();
 
-  const [logEntries, setLogEntries] = useState<LogEntry[]>([]);
-  const logIdCounter = useRef(0);
-
-  const appendLogEntry = useCallback((content: string) => {
-    const id = `log-${logIdCounter.current++}`;
-    setLogEntries(prev => [...prev, { id, content }]);
-    return id;
-  }, [logIdCounter, setLogEntries]);
-
-  const updateLogEntry = useCallback((id: string, updater: (current: string) => string) => {
-    setLogEntries(prev => prev.map(entry => (entry.id === id ? { ...entry, content: updater(entry.content) } : entry)));
-  }, [setLogEntries]);
-
-  const appendToLogEntry = useCallback((id: string, text: string) => {
-    updateLogEntry(id, current => current + text);
-  }, [updateLogEntry]);
+  const appendLog = useCallback((content: string) => {
+    (stdout ?? process.stdout).write(content);
+  }, [stdout]);
 
   const [input, setInput] = useState('');
   const [isProcessing, setIsProcessing] = useState(false);
@@ -336,8 +310,8 @@ const ChatInterface: React.FC<{
       lines.push('History cleared. New session started.');
       clearedNoticeRef.current = false;
     }
-    appendLogEntry(lines.join('\n'));
-  }, [appendLogEntry, sessionData]);
+    appendLog(lines.join('\n') + '\n');
+  }, [appendLog, sessionData]);
 
   const executeToolCall = async (toolCall: ToolCall): Promise<ToolResult> => {
     const toolName = toolCall.function.name;
@@ -353,7 +327,7 @@ const ChatInterface: React.FC<{
         .join(', ');
     } catch {}
 
-    appendLogEntry(`🔧 Executing: ${toolName}(${argsStr})`);
+    appendLog(`🔧 Executing: ${toolName}(${argsStr})\n`);
 
     let result: ToolResult;
     try {
@@ -410,7 +384,7 @@ const ChatInterface: React.FC<{
     }
 
     const indented = resultText.split('\n').map(l => `  ${l}`).join('\n');
-    appendLogEntry(`[${toolName}] ${result.status}:\n${indented}\n`);
+    appendLog(`[${toolName}] ${result.status}:\n${indented}\n`);
 
     return result;
   };
@@ -459,14 +433,12 @@ const ChatInterface: React.FC<{
 
         let accumulatedOutput = '';
         let headerPrinted = false;
-        let assistantLogEntryId: string | null = null;
 
-        const ensureHeader = (): string => {
+        const ensureHeader = () => {
           if (!headerPrinted) {
             headerPrinted = true;
-            assistantLogEntryId = appendLogEntry('\n🤖 Fry:\n');
+            appendLog('\n🤖 Fry:\n');
           }
-          return assistantLogEntryId!;
         };
 
         const builtinToolsKw: string[] = [];
@@ -516,26 +488,26 @@ const ChatInterface: React.FC<{
                 toolDisplayState.set(tc.index, display);
               }
 
-              const logId = ensureHeader();
+              ensureHeader();
 
               if (!display.headerShown) {
-                appendToLogEntry(logId, `\n\n🔧 Tool call #${tc.index + 1}\n`);
+                appendLog(`\n\n🔧 Tool call #${tc.index + 1}\n`);
                 display.headerShown = true;
               }
               if (tc.id && tc.id !== display.id) {
                 display.id = tc.id;
-                appendToLogEntry(logId, `  id: ${tc.id}\n`);
+                appendLog(`  id: ${tc.id}\n`);
               }
               if (tc.function?.name && tc.function.name !== display.name) {
                 display.name = tc.function.name;
-                appendToLogEntry(logId, `  name: ${tc.function.name}\n`);
+                appendLog(`  name: ${tc.function.name}\n`);
               }
               if (typeof tc.function?.arguments === 'string' && tc.function.arguments.length > 0) {
                 if (!display.argsLabelShown) {
-                  appendToLogEntry(logId, '  arguments: ');
+                  appendLog('  arguments: ');
                   display.argsLabelShown = true;
                 }
-                appendToLogEntry(logId, tc.function.arguments);
+                appendLog(tc.function.arguments);
                 display.lastChunkEndedWithNewline = tc.function.arguments.endsWith('\n');
               }
             }
@@ -544,24 +516,21 @@ const ChatInterface: React.FC<{
           if (delta.content) {
             const piece = delta.content;
             accumulatedOutput += piece;
-            const logId = ensureHeader();
-            appendToLogEntry(logId, piece);
+            ensureHeader();
+            appendLog(piece);
           }
         }
 
         toolDisplayState.forEach((state) => {
           if (state.argsLabelShown && !state.lastChunkEndedWithNewline) {
-            if (assistantLogEntryId) {
-              appendToLogEntry(assistantLogEntryId, '\n');
-            }
+            ensureHeader();
+            appendLog('\n');
             state.lastChunkEndedWithNewline = true;
           }
         });
 
         if (headerPrinted && accumulatedOutput.length > 0 && !accumulatedOutput.endsWith('\n')) {
-          if (assistantLogEntryId) {
-            appendToLogEntry(assistantLogEntryId, '\n');
-          }
+          appendLog('\n');
         }
 
         const assistantMessage: Message = { role: 'assistant' };
@@ -623,10 +592,10 @@ const ChatInterface: React.FC<{
         }
       }
     } catch (error) {
-      appendLogEntry(`\nError: ${String(error)}`);
+      appendLog(`\nError: ${String(error)}\n`);
     } finally {
       if (isInterruptedRef.current) {
-        appendLogEntry(`\n✗ Response interrupted by user.`);
+        appendLog(`\n✗ Response interrupted by user.\n`);
         isInterruptedRef.current = false;
       }
       setIsProcessing(false);
@@ -650,10 +619,6 @@ const ChatInterface: React.FC<{
         isInterruptedRef.current = false;
         turnMessages.current = [];
         conversationHistory.current = [];
-
-        setLogEntries([]);
-
-        clearTerminalOutput();
         const newSessionInfo: SessionData = { session_id: Math.random().toString(36).slice(2, 10), tier: 'local' };
         clearedNoticeRef.current = true;
         onResetSession(newSessionInfo);
@@ -663,7 +628,7 @@ const ChatInterface: React.FC<{
       return;
     }
 
-    appendLogEntry(`\n👤 You:\n${userInput}`);
+    appendLog(`\n👤 You:\n${userInput}\n`);
 
     await processChatTurn(userInput);
   };
@@ -684,14 +649,8 @@ const ChatInterface: React.FC<{
 
   return (
     <Box flexDirection="column">
-      <Box flexDirection="column" marginBottom={1}>
-        {logEntries.map(entry => (
-          <Text key={entry.id}>{entry.content}</Text>
-        ))}
-      </Box>
-
       {isProcessing ? (
-        <Box marginTop={1}>
+        <Box>
           <Text color="cyan">Processing... (Ctrl+C to interrupt)</Text>
         </Box>
       ) : (
