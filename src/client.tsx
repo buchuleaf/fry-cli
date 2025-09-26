@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // client.tsx
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { render, Text, Box, useInput, useApp, useStdout } from 'ink';
+import { format } from 'node:util';
 import Gradient from 'ink-gradient';
 import SelectInput from 'ink-select-input';
 import { OpenAI } from 'openai/index.mjs';
@@ -277,38 +278,6 @@ const getLocalTools = () => {
   return tools;
 };
 
-const clearTerminalOutput = () => {
-  console.clear();
-
-  if (!process.stdout.isTTY) return;
-
-  // Clear scrollback and move cursor to top-left for a clean slate
-  process.stdout.write('\u001B[3J\u001B[2J\u001B[H');
-};
-
-const markdownParserCache = new Map<number, Marked>();
-
-const getMarkdownParser = (columns?: number) => {
-  const width = columns && Number.isFinite(columns) && columns > 0 ? columns : 80;
-  if (!markdownParserCache.has(width)) {
-    markdownParserCache.set(width, new Marked({
-      renderer: new TerminalRenderer({ width, reflowText: false, tab: 2 })
-    }));
-  }
-  return markdownParserCache.get(width)!;
-};
-
-const renderMarkdownToAnsi = (markdown: string, columns?: number): string => {
-  if (!markdown) return '';
-  try {
-    const parser = getMarkdownParser(columns);
-    const rendered = parser.parse(markdown, { async: false }) as string;
-    return typeof rendered === 'string' ? rendered : markdown;
-  } catch {
-    return markdown;
-  }
-};
-
 // ===== Chat Component =====
 
 const ChatInterface: React.FC<{
@@ -320,10 +289,41 @@ const ChatInterface: React.FC<{
   const { exit } = useApp();
   const { stdout } = useStdout();
 
-  const stdoutRef = useRef(stdout);
-  useEffect(() => {
-    stdoutRef.current = stdout;
+  const appendLog = useCallback((content: string) => {
+    (stdout ?? process.stdout).write(content);
   }, [stdout]);
+
+  useEffect(() => {
+    const originalConsole = {
+      log: console.log,
+      info: console.info,
+      warn: console.warn,
+      error: console.error,
+      debug: console.debug,
+    };
+
+    const wrap = <T extends (...args: any[]) => void>(original: T): T => {
+      const wrapped = ((...args: Parameters<T>) => {
+        const text = format(...args);
+        appendLog(text.endsWith('\n') ? text : `${text}\n`);
+      }) as T;
+      return wrapped;
+    };
+
+    console.log = wrap(originalConsole.log);
+    console.info = wrap(originalConsole.info);
+    console.warn = wrap(originalConsole.warn);
+    console.error = wrap(originalConsole.error);
+    console.debug = wrap(originalConsole.debug);
+
+    return () => {
+      console.log = originalConsole.log;
+      console.info = originalConsole.info;
+      console.warn = originalConsole.warn;
+      console.error = originalConsole.error;
+      console.debug = originalConsole.debug;
+    };
+  }, [appendLog]);
 
   const [input, setInput] = useState('');
   const [isProcessing, setIsProcessing] = useState(false);
@@ -336,23 +336,17 @@ const ChatInterface: React.FC<{
   const turnMessages = useRef<Message[]>([]);
 
   useEffect(() => {
-    if (!stdoutRef.current) return;
-    stdoutRef.current.write(`\nFryCLI | Session: ${sessionData.session_id.substring(0, 8)}... | ${sessionData.tier.toUpperCase()}\n`);
-    stdoutRef.current.write(`Working directory: ${process.cwd()}\n`);
+    const lines = [
+      '',
+      `FryCLI | Session: ${sessionData.session_id.substring(0, 8)}... | ${sessionData.tier.toUpperCase()}`,
+      `Working directory: ${process.cwd()}`
+    ];
     if (clearedNoticeRef.current) {
-      stdoutRef.current.write('History cleared. New session started.\n');
+      lines.push('History cleared. New session started.');
       clearedNoticeRef.current = false;
     }
-  }, [sessionData]);
-
-  const write = (text: string) => {
-    if (!stdoutRef.current) return;
-    stdoutRef.current.write(text);
-  };
-
-  const writeLine = (text: string) => {
-    write(text.endsWith('\n') ? text : `${text}\n`);
-  };
+    appendLog(lines.join('\n') + '\n');
+  }, [appendLog, sessionData]);
 
   const executeToolCall = async (toolCall: ToolCall): Promise<ToolResult> => {
     const toolName = toolCall.function.name;
@@ -368,7 +362,7 @@ const ChatInterface: React.FC<{
         .join(', ');
     } catch {}
 
-    writeLine(`\n🔧 Executing: ${toolName}(${argsStr})`);
+    appendLog(`🔧 Executing: ${toolName}(${argsStr})\n`);
 
     let result: ToolResult;
     try {
@@ -425,9 +419,7 @@ const ChatInterface: React.FC<{
     }
 
     const indented = resultText.split('\n').map(l => `  ${l}`).join('\n');
-    writeLine(`[${toolName}] ${result.status}:`);
-    writeLine(indented);
-    write('\n');
+    appendLog(`[${toolName}] ${result.status}:\n${indented}\n`);
 
     return result;
   };
@@ -481,9 +473,10 @@ const ChatInterface: React.FC<{
         let lastRenderedDisplay = '';
 
         const ensureHeader = () => {
-          if (headerPrinted) return;
-          headerPrinted = true;
-          write('\n🤖 Fry:\n');
+          if (!headerPrinted) {
+            headerPrinted = true;
+            appendLog('\n🤖 Fry:\n');
+          }
         };
 
         const builtinToolsKw: string[] = [];
@@ -497,6 +490,14 @@ const ChatInterface: React.FC<{
         });
 
         const toolAssembler: Map<number, ToolCall> = new Map();
+        type ToolDisplayState = {
+          headerShown: boolean;
+          id?: string;
+          name?: string;
+          argsLabelShown: boolean;
+          lastChunkEndedWithNewline: boolean;
+        };
+        const toolDisplayState: Map<number, ToolDisplayState> = new Map();
         const toolCalls: ToolCall[] = [];
 
         for await (const chunk of stream as AsyncIterable<StreamChunk>) {
@@ -514,6 +515,39 @@ const ChatInterface: React.FC<{
               if (tc.id) acc.id = tc.id;
               if (tc.function?.name && !acc.function.name) acc.function.name = tc.function.name;
               if (tc.function?.arguments) acc.function.arguments += tc.function.arguments;
+
+              let display = toolDisplayState.get(tc.index);
+              if (!display) {
+                display = {
+                  headerShown: false,
+                  argsLabelShown: false,
+                  lastChunkEndedWithNewline: false,
+                };
+                toolDisplayState.set(tc.index, display);
+              }
+
+              ensureHeader();
+
+              if (!display.headerShown) {
+                appendLog(`\n\n🔧 Tool call #${tc.index + 1}\n`);
+                display.headerShown = true;
+              }
+              if (tc.id && tc.id !== display.id) {
+                display.id = tc.id;
+                appendLog(`  id: ${tc.id}\n`);
+              }
+              if (tc.function?.name && tc.function.name !== display.name) {
+                display.name = tc.function.name;
+                appendLog(`  name: ${tc.function.name}\n`);
+              }
+              if (typeof tc.function?.arguments === 'string' && tc.function.arguments.length > 0) {
+                if (!display.argsLabelShown) {
+                  appendLog('  arguments: ');
+                  display.argsLabelShown = true;
+                }
+                appendLog(tc.function.arguments);
+                display.lastChunkEndedWithNewline = tc.function.arguments.endsWith('\n');
+              }
             }
           }
 
@@ -559,17 +593,6 @@ const ChatInterface: React.FC<{
           const renderedForDisplay = rendered || accumulatedOutput;
           if (renderedForDisplay.trim().length > 0) {
             ensureHeader();
-            const normalizedDisplay = renderedForDisplay.endsWith('\n')
-              ? renderedForDisplay
-              : `${renderedForDisplay}\n`;
-            write(normalizedDisplay);
-            lastRenderedDisplay = normalizedDisplay;
-            hasStreamRendered = true;
-          }
-        }
-
-        if (!isStdoutTty && hasStreamRendered && !accumulatedOutput.endsWith('\n')) {
-          write('\n');
         }
 
         const assistantMessage: Message = { role: 'assistant' };
@@ -631,10 +654,10 @@ const ChatInterface: React.FC<{
         }
       }
     } catch (error) {
-      writeLine(`\nError: ${String(error)}`);
+      appendLog(`\nError: ${String(error)}\n`);
     } finally {
       if (isInterruptedRef.current) {
-        writeLine(`\n✗ Response interrupted by user.`);
+        appendLog(`\n✗ Response interrupted by user.\n`);
         isInterruptedRef.current = false;
       }
       setIsProcessing(false);
@@ -658,8 +681,6 @@ const ChatInterface: React.FC<{
         isInterruptedRef.current = false;
         turnMessages.current = [];
         conversationHistory.current = [];
-
-        clearTerminalOutput();
         const newSessionInfo: SessionData = { session_id: Math.random().toString(36).slice(2, 10), tier: 'local' };
         clearedNoticeRef.current = true;
         onResetSession(newSessionInfo);
@@ -669,9 +690,7 @@ const ChatInterface: React.FC<{
       return;
     }
 
-    write('\n');
-    writeLine('👤 You:');
-    writeLine(userInput);
+    appendLog(`\n👤 You:\n${userInput}\n`);
 
     await processChatTurn(userInput);
   };
@@ -693,7 +712,7 @@ const ChatInterface: React.FC<{
   return (
     <Box flexDirection="column">
       {isProcessing ? (
-        <Box marginTop={1}>
+        <Box>
           <Text color="cyan">Processing... (Ctrl+C to interrupt)</Text>
         </Box>
       ) : (
