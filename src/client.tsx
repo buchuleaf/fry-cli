@@ -17,6 +17,8 @@ import { spawnSync } from 'child_process';
 import * as fsSync from 'fs';
 import { fileURLToPath } from 'url';
 import { readFile } from 'fs/promises';
+import { Marked } from 'marked';
+import TerminalRenderer from 'marked-terminal';
 
 // ===== Helpers: directory listing (workspace snapshot) =====
 async function getRootDirectoryListing(maxChars: number = 4000): Promise<string> {
@@ -466,6 +468,9 @@ const ChatInterface: React.FC<{
 
         let accumulatedOutput = '';
         let headerPrinted = false;
+        const isStdoutTty = Boolean(stdoutRef.current && (stdoutRef.current as any).isTTY);
+        let hasStreamRendered = false;
+        let lastRenderedDisplay = '';
 
         const ensureHeader = () => {
           if (!headerPrinted) {
@@ -547,23 +552,47 @@ const ChatInterface: React.FC<{
           }
 
           if (delta.content) {
-            const piece = delta.content;
-            accumulatedOutput += piece;
+            accumulatedOutput += delta.content;
+
+            const columns = stdoutRef.current?.columns ?? process.stdout?.columns;
+            const rendered = renderMarkdownToAnsi(accumulatedOutput, columns);
+            const renderedForDisplay = rendered || accumulatedOutput;
+            const normalizedDisplay = renderedForDisplay.endsWith('\n')
+              ? renderedForDisplay
+              : `${renderedForDisplay}\n`;
+
+            if (!hasStreamRendered && normalizedDisplay.trim().length === 0) {
+              continue;
+            }
+
             ensureHeader();
-            appendLog(piece);
+
+            if (isStdoutTty) {
+              if (!hasStreamRendered) {
+                write('\u001B[s');
+                write(normalizedDisplay);
+                hasStreamRendered = true;
+              } else if (normalizedDisplay !== lastRenderedDisplay) {
+                write('\u001B[u');
+                write('\u001B[s');
+                write('\u001B[J');
+                write(normalizedDisplay);
+              }
+            } else {
+              write(delta.content);
+              hasStreamRendered = true;
+            }
+
+            lastRenderedDisplay = normalizedDisplay;
           }
         }
 
-        toolDisplayState.forEach((state) => {
-          if (state.argsLabelShown && !state.lastChunkEndedWithNewline) {
+        if (!hasStreamRendered && accumulatedOutput.length > 0) {
+          const columns = stdoutRef.current?.columns ?? process.stdout?.columns;
+          const rendered = renderMarkdownToAnsi(accumulatedOutput, columns);
+          const renderedForDisplay = rendered || accumulatedOutput;
+          if (renderedForDisplay.trim().length > 0) {
             ensureHeader();
-            appendLog('\n');
-            state.lastChunkEndedWithNewline = true;
-          }
-        });
-
-        if (headerPrinted && accumulatedOutput.length > 0 && !accumulatedOutput.endsWith('\n')) {
-          appendLog('\n');
         }
 
         const assistantMessage: Message = { role: 'assistant' };
