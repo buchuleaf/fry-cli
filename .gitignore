@@ -1,6 +1,4 @@
 dist
 node_modules
-
-workspace/
-
 package-lock.json
+workspace/test_1

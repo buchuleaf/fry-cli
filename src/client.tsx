@@ -12,6 +12,7 @@ import * as os from 'os';
 import meow from 'meow';
 // import open from 'open'; // removed with auth/dashboard flows
 import { LocalToolExecutor, ToolCall, ToolResult } from './tools.js';
+import { buildDeveloperPrompt } from './prompt.js';
 import * as https from 'https';
 import { spawnSync } from 'child_process';
 import * as fsSync from 'fs';
@@ -488,27 +489,13 @@ const ChatInterface: React.FC<{
       const workspaceContents = await getRootDirectoryListing();
       const includeFs = true;
       const includeExec = true;
-      const fsGuidance = includeFs
-        ? "\nFilesystem tools (fs.*): fs.ls, fs.read, fs.write, fs.mkdir, fs.apply_patch.\n" +
-          "- Paths are relative to the current working directory.\n" +
-          "- Use only relative paths, not absolute paths.\n" +
-          "- There is no fs.search_files tool; use the exec tool (runtime 'shell' or 'python') for searches and filtering.\n" +
-          "- fs.read: returns up to 200 lines. Params: { path, start_line?, end_line? }. If end_line is omitted, returns 50 lines starting at start_line (default 1).\n" +
-          "  The response includes metadata: { content, start_line, end_line, total_lines, has_more, next_start_line }.\n" +
-          "- For multi-file edits, use fs.apply_patch with the pseudo-unified patch format bounded by '*** Begin Patch' and '*** End Patch'.\n"
-        : '';
-      const execGuidance = includeExec
-        ? "\nExec tool: use { runtime: 'shell' | 'python' } to run local commands/code.\n" +
-          "- Runs in the current working directory.\n" +
-          "- Use shell commands (e.g. rg/grep/find) or Python snippets via exec for any search or traversal tasks.\n" +
-          "- Large outputs are paginated with metadata for navigation.\n"
-        : '';
 
-      const developerContent = (
-        "You are a helpful terminal assistant. Follow all user requests to the best of your abilities\n" +
-        fsGuidance + execGuidance + "\n" +
-        `The current directory contains the following files:\n${workspaceContents}\n`
-      );
+      const developerContent = await buildDeveloperPrompt({
+        workspaceListing: workspaceContents,
+        includeFsTools: includeFs,
+        includeExecTool: includeExec,
+        cwd: process.cwd()
+      });
 
       const messagesForLlm: any[] = [
         { role: 'developer', content: developerContent },
@@ -812,6 +799,10 @@ const ChatPrompt: React.FC<{
 }> = ({ value, onChange, onSubmit, isActive = true }) => {
   useInput(
     (input, key) => {
+      const isBackspaceChar = input === '\u0008' || input === '\u007f';
+      const isBackspace = key.backspace || isBackspaceChar;
+      const isCtrlBackspace = key.ctrl && isBackspace;
+
       if (key.return && !key.shift) {
         if (value.trim()) {
           onSubmit(value);
@@ -824,14 +815,14 @@ const ChatPrompt: React.FC<{
       }
 
       // Ctrl+Backspace → delete previous word
-      if (key.ctrl && key.backspace) {
+      if (isCtrlBackspace) {
         const next = value.replace(/\s+$/, '');
         const removed = next.replace(/\S+$/, '');
         onChange(removed);
         return;
       }
 
-      if (key.backspace) {
+      if (isBackspace) {
         onChange(value.slice(0, -1));
         return;
       }
