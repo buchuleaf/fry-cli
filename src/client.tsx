@@ -45,6 +45,21 @@ function ensureTrailingNewline(value: string): string {
   return value.endsWith('\n') ? value : `${value}\n`;
 }
 
+const ANSI_CSI_PATTERN = /\u001b\[[0-9;?]*[ -\/]*[@-~]/g;
+const ANSI_OSC_PATTERN = /\u001b\][^\u0007]*(?:\u0007|\u001b\\)/g;
+const CONTROL_CHARS_PATTERN = /[\u0000-\u0008\u000b-\u001a\u001c-\u001f\u007f]/g;
+
+function sanitizeForDisplay(value: string): string {
+  if (!value) return value;
+
+  let sanitized = value.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  sanitized = sanitized.replace(ANSI_OSC_PATTERN, '');
+  sanitized = sanitized.replace(ANSI_CSI_PATTERN, (sequence) => sequence.endsWith('m') ? sequence : '');
+  sanitized = sanitized.replace(CONTROL_CHARS_PATTERN, '');
+
+  return sanitized;
+}
+
 // ===== Helpers: directory listing (workspace snapshot) =====
 async function getRootDirectoryListing(maxChars: number = 4000): Promise<string> {
   try {
@@ -223,6 +238,115 @@ type ToolDisplayAccumulator = {
   args: string;
 };
 
+const HARMONY_TOKENS = {
+  START: '<|start|>',
+  CHANNEL: '<|channel|>',
+  MESSAGE: '<|message|>',
+  END: '<|end|>',
+  RETURN: '<|return|>',
+  CALL: '<|call|>'
+} as const;
+
+interface ParsedHarmonyMessage {
+  role: string;
+  channel?: string;
+  content?: string;
+  recipient?: string;
+  contentType?: string;
+  stopToken?: string | null;
+}
+
+function parseHarmonyMessages(raw: string): ParsedHarmonyMessage[] {
+  if (!raw || !raw.includes(HARMONY_TOKENS.START)) {
+    return [];
+  }
+
+  const messages: ParsedHarmonyMessage[] = [];
+  const pattern = /<\|start\|>(.*?)(?=<\|start\||$)/gs;
+  let match: RegExpExecArray | null;
+
+  while ((match = pattern.exec(raw)) !== null) {
+    const segment = match[1];
+    const channelIdx = segment.indexOf(HARMONY_TOKENS.CHANNEL);
+    if (channelIdx === -1) {
+      continue;
+    }
+
+    const headerPart = segment.slice(0, channelIdx).trim();
+    const channelAndMessagePart = segment.slice(channelIdx + HARMONY_TOKENS.CHANNEL.length);
+    const messageIdx = channelAndMessagePart.indexOf(HARMONY_TOKENS.MESSAGE);
+    if (messageIdx === -1) {
+      continue;
+    }
+
+    const channelInfoRaw = channelAndMessagePart.slice(0, messageIdx).trim();
+    const contentAndStops = channelAndMessagePart.slice(messageIdx + HARMONY_TOKENS.MESSAGE.length);
+
+    const channelInfoParts = channelInfoRaw.split(/\s+/).filter(Boolean);
+    if (channelInfoParts.length === 0) {
+      continue;
+    }
+    const [channel, ...channelExtras] = channelInfoParts;
+    const contentType = channelExtras.length > 0 ? channelExtras.join(' ') : undefined;
+
+    let role = headerPart;
+    let recipient: string | undefined;
+    const toMatch = headerPart.match(/\bto=([^\s]+)/);
+    if (toMatch) {
+      recipient = toMatch[1];
+      role = headerPart.slice(0, toMatch.index).trim();
+    }
+
+    role = role.split(/\s+/)[0] ?? role;
+
+    const stopCandidates: Array<{ token: string; index: number }> = [
+      { token: HARMONY_TOKENS.END, index: contentAndStops.indexOf(HARMONY_TOKENS.END) },
+      { token: HARMONY_TOKENS.RETURN, index: contentAndStops.indexOf(HARMONY_TOKENS.RETURN) },
+      { token: HARMONY_TOKENS.CALL, index: contentAndStops.indexOf(HARMONY_TOKENS.CALL) }
+    ].filter(({ index }) => index !== -1);
+
+    let stopToken = null;
+    let content = contentAndStops;
+
+    if (stopCandidates.length > 0) {
+      stopCandidates.sort((a, b) => a.index - b.index);
+      const firstStop = stopCandidates[0];
+      stopToken = firstStop.token;
+      content = contentAndStops.slice(0, firstStop.index);
+    }
+
+    messages.push({
+      role,
+      channel,
+      content,
+      recipient,
+      contentType,
+      stopToken
+    });
+  }
+
+  return messages;
+}
+
+function decodeHarmonyToolArguments(raw?: string): string {
+  if (!raw) return '';
+  const trimmed = raw.trim();
+  if (!trimmed) return '';
+
+  if (trimmed.startsWith('"') && trimmed.endsWith('"')) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (typeof parsed === 'string') {
+        return parsed;
+      }
+    } catch {
+      // ignore parse failure, fall through
+    }
+  }
+
+  return trimmed;
+}
+
 function formatToolDisplay(index: number, data: ToolDisplayAccumulator): string {
   const lines: string[] = [`🔧 Tool call #${index + 1}`];
   if (data.id) {
@@ -237,7 +361,7 @@ function formatToolDisplay(index: number, data: ToolDisplayAccumulator): string 
       lines.push(`    ${argLine}`);
     }
   }
-  return lines.join('\n');
+  return sanitizeForDisplay(lines.join('\n'));
 }
 
 // ===== Local tool definitions (exec + fs.*) =====
@@ -352,8 +476,9 @@ const ChatInterface: React.FC<{
   const [activeStream, setActiveStream] = useState<string | null>(null);
   const [transientToolDisplays, setTransientToolDisplays] = useState<Array<{ id: string; content: string }>>([]);
 
-  const appendLog = useCallback((content: string, kind: LogKind = 'log') => {
+  const appendLog = useCallback((rawContent: string, kind: LogKind = 'log') => {
     const id = `log-${logIdRef.current++}`;
+    const content = sanitizeForDisplay(rawContent);
     setLogEntries(prev => [...prev, { id, kind, content }]);
   }, []);
 
@@ -517,7 +642,7 @@ const ChatInterface: React.FC<{
       while (true) {
         if (isInterruptedRef.current) break;
 
-        let accumulatedOutput = '';
+        let rawHarmonyResponse = '';
         let headerPrinted = false;
         let hasStreamRendered = false;
 
@@ -536,7 +661,7 @@ const ChatInterface: React.FC<{
 
         const toolAssembler: Map<number, ToolCall> = new Map();
         const toolDisplayBuffer: Map<number, ToolDisplayAccumulator> = new Map();
-        const toolCalls: ToolCall[] = [];
+        let displayBuffer = '';
 
         const syncTransientToolDisplays = () => {
           if (toolDisplayBuffer.size === 0) {
@@ -581,9 +706,10 @@ const ChatInterface: React.FC<{
           }
 
           if (delta.content) {
-            accumulatedOutput += delta.content;
+            rawHarmonyResponse += delta.content;
+            displayBuffer = sanitizeForDisplay(rawHarmonyResponse);
 
-            if (!hasStreamRendered && accumulatedOutput.trim().length === 0) {
+            if (!hasStreamRendered && displayBuffer.trim().length === 0) {
               continue;
             }
 
@@ -591,29 +717,109 @@ const ChatInterface: React.FC<{
               headerPrinted = true;
             }
 
-            setActiveStream(prev => (prev === accumulatedOutput ? prev : accumulatedOutput));
+            setActiveStream(prev => (prev === displayBuffer ? prev : displayBuffer));
             hasStreamRendered = true;
           }
         }
 
-        if (!hasStreamRendered && accumulatedOutput.length > 0) {
-          if (accumulatedOutput.trim().length > 0) {
+        if (!hasStreamRendered && rawHarmonyResponse.length > 0) {
+          const fallbackDisplay = sanitizeForDisplay(rawHarmonyResponse);
+          if (fallbackDisplay.trim().length > 0) {
             if (!headerPrinted) {
               headerPrinted = true;
             }
-            setActiveStream(accumulatedOutput);
+            setActiveStream(fallbackDisplay);
+            displayBuffer = fallbackDisplay;
             hasStreamRendered = true;
           }
         }
 
-        if (headerPrinted && accumulatedOutput.trim().length > 0) {
-          appendLog(accumulatedOutput, 'assistant');
-        }
+        const finalDisplay = displayBuffer || sanitizeForDisplay(rawHarmonyResponse);
+        const parsedHarmony = parseHarmonyMessages(rawHarmonyResponse);
+        const isHarmonyResponse = parsedHarmony.length > 0;
 
-        if (toolDisplayBuffer.size > 0) {
-          for (const [index, data] of toolDisplayBuffer.entries()) {
-            const content = formatToolDisplay(index, data);
-            appendLog(`\n${content}\n`, 'tool');
+        const toolCalls: ToolCall[] = [];
+        let assistantContent: string | undefined;
+
+        if (isHarmonyResponse) {
+          if (finalDisplay.trim().length > 0) {
+            appendLog(`Raw Harmony response\n${finalDisplay}\n`, 'assistant');
+          }
+
+          const analysisChunks: string[] = [];
+          const finalChunks: string[] = [];
+          const finalDisplays: string[] = [];
+          const commentaryDisplays: Array<{ label: string; content: string }> = [];
+
+          for (const msg of parsedHarmony) {
+            if (msg.role !== 'assistant') {
+              continue;
+            }
+
+            const rawContent = msg.content ?? '';
+            const sanitizedContent = sanitizeForDisplay(rawContent);
+
+            if (msg.channel === 'analysis') {
+              if (sanitizedContent.trim().length > 0) {
+                analysisChunks.push(sanitizedContent);
+              }
+            } else if (msg.channel === 'final') {
+              if (rawContent.trim().length > 0) {
+                finalChunks.push(rawContent);
+              }
+              if (sanitizedContent.trim().length > 0) {
+                finalDisplays.push(sanitizedContent);
+              }
+            } else if (msg.channel === 'commentary') {
+              const decodedArgs = decodeHarmonyToolArguments(rawContent);
+              const displaySource = decodedArgs || rawContent;
+              const displayContent = sanitizeForDisplay(displaySource);
+              const label = msg.recipient && msg.recipient.startsWith('functions.')
+                ? 'commentary → ' + msg.recipient.slice('functions.'.length)
+                : msg.recipient
+                  ? 'commentary → ' + msg.recipient
+                  : 'commentary';
+              commentaryDisplays.push({
+                label,
+                content: displayContent.trim().length > 0 ? displayContent : '(empty)'
+              });
+              if (msg.recipient && msg.recipient.startsWith('functions.')) {
+                const fnName = msg.recipient.slice('functions.'.length);
+                const args = decodedArgs || rawContent.trim();
+                toolCalls.push({ id: '', type: 'function', function: { name: fnName, arguments: args } });
+              }
+            }
+          }
+
+          for (const chunk of analysisChunks) {
+            appendLog(`[analysis] ${chunk}\n`, 'assistant');
+          }
+          for (const display of finalDisplays) {
+            appendLog(`[final] ${display}\n`, 'assistant');
+          }
+          for (const entry of commentaryDisplays) {
+            appendLog(`[${entry.label}] ${entry.content}\n`, 'tool');
+          }
+
+          const combinedFinal = finalChunks.map(part => part.trim()).filter(Boolean).join('\n\n');
+          if (combinedFinal.trim().length > 0) {
+            assistantContent = combinedFinal;
+          }
+        } else {
+          if (headerPrinted && finalDisplay.trim().length > 0) {
+            appendLog(finalDisplay, 'assistant');
+          }
+
+          if (toolDisplayBuffer.size > 0) {
+            for (const [index, data] of toolDisplayBuffer.entries()) {
+              const content = formatToolDisplay(index, data);
+              appendLog(`\n${content}\n`, 'tool');
+            }
+          }
+
+          assistantContent = finalDisplay.trim().length > 0 ? finalDisplay : undefined;
+          for (const value of toolAssembler.values()) {
+            toolCalls.push(value);
           }
         }
 
@@ -621,11 +827,10 @@ const ChatInterface: React.FC<{
         setTransientToolDisplays([]);
 
         const assistantMessage: Message = { role: 'assistant' };
-        if (accumulatedOutput.trim().length > 0) {
-          assistantMessage.content = accumulatedOutput;
+        if (assistantContent && assistantContent.trim().length > 0) {
+          assistantMessage.content = assistantContent.trim();
         }
 
-        toolCalls.push(...Array.from(toolAssembler.values()));
         for (const tc of toolCalls) {
           if (!tc.id || tc.id.length === 0) tc.id = `call_${Math.random().toString(36).slice(2, 10)}`;
         }
@@ -960,6 +1165,19 @@ const App: React.FC<{ modelName: string; }> = ({ modelName }) => {
   );
 };
 
+function hasInteractiveTerminal(): boolean {
+  const stdin = process.stdin as NodeJS.ReadStream | undefined;
+  return Boolean(process.stdout.isTTY && stdin?.isTTY && typeof stdin?.setRawMode === 'function');
+}
+
+function warnNonInteractiveTerminal(): void {
+  const lines = [
+    'Fry CLI requires an interactive terminal (TTY) with raw mode support.',
+    'Please run this command inside a compatible terminal emulator or enable TTY forwarding.'
+  ];
+  process.stderr.write(`${lines.join('\n')}\n`);
+}
+
 // ===== CLI/bootstrap =====
 const cli = meow(
   `
@@ -982,9 +1200,22 @@ Options
 (async () => {
   //await maybeSelfUpdate({ skip: !cli.flags.update });
   const modelName = cli.flags.model || process.env.FRY_MODEL_NAME || 'llama';
+  const forceTtyEnv = String(process.env.FRYCLI_FORCE_TTY || '').toLowerCase();
+  const forceInteractive = forceTtyEnv === '1' || forceTtyEnv === 'true';
+
+  if (!forceInteractive && !hasInteractiveTerminal()) {
+    warnNonInteractiveTerminal();
+    process.exitCode = 1;
+    return;
+  }
 
   render(
     <App modelName={modelName} />,
-    { exitOnCtrlC: false }
+    {
+      exitOnCtrlC: false,
+      stdout: process.stdout,
+      stderr: process.stderr,
+      stdin: process.stdin
+    }
   );
 })();
