@@ -40,6 +40,11 @@ function renderMarkdownToAnsi(markdown: string, columns?: number): string {
   }
 }
 
+function ensureTrailingNewline(value: string): string {
+  if (!value) return value;
+  return value.endsWith('\n') ? value : `${value}\n`;
+}
+
 // ===== Helpers: directory listing (workspace snapshot) =====
 async function getRootDirectoryListing(maxChars: number = 4000): Promise<string> {
   try {
@@ -737,52 +742,60 @@ const ChatInterface: React.FC<{
         {(entry) => {
           if (entry.kind === 'assistant') {
             const markdown = renderMarkdownToAnsi(entry.content, stdout?.columns ?? process.stdout?.columns) || entry.content;
+            const display = ensureTrailingNewline(markdown);
             return (
               <Box key={entry.id} flexDirection="column" marginTop={1}>
                 <Text color="green">🤖 Fry:</Text>
-                <Text>{markdown}</Text>
+                <Text>{display}</Text>
               </Box>
             );
           }
 
           if (entry.kind === 'user') {
+            const display = ensureTrailingNewline(entry.content);
             return (
               <Box key={entry.id} flexDirection="column" marginTop={1}>
                 <Text color="blue">👤 You:</Text>
-                <Text>{entry.content}</Text>
+                <Text>{display}</Text>
               </Box>
             );
           }
 
           if (entry.kind === 'tool') {
+            const display = ensureTrailingNewline(entry.content);
             return (
               <Box key={entry.id} flexDirection="column" marginTop={1}>
-                <Text color="yellow">{entry.content}</Text>
+                <Text color="yellow">{display}</Text>
               </Box>
             );
           }
 
           if (entry.kind === 'error') {
+            const display = ensureTrailingNewline(entry.content);
             return (
               <Box key={entry.id} flexDirection="column" marginTop={1}>
-                <Text color="red">{entry.content}</Text>
+                <Text color="red">{display}</Text>
               </Box>
             );
           }
 
+          const markdown = renderMarkdownToAnsi(entry.content, stdout?.columns ?? process.stdout?.columns) || entry.content;
+          const display = ensureTrailingNewline(markdown);
           return (
             <Box key={entry.id} flexDirection="column" marginTop={1}>
-              <Text>{entry.content}</Text>
+              <Text>{display}</Text>
             </Box>
           );
         }}
       </Static>
 
-      {activeStream && activeStream.trim().length > 0 && (
+      {isProcessing && activeStream && activeStream.trim().length > 0 && (
         <Box flexDirection="column" marginTop={1}>
           <Text color="green">🤖 Fry:</Text>
           <Text>
-            {renderMarkdownToAnsi(activeStream, stdout?.columns ?? process.stdout?.columns) || activeStream}
+            {ensureTrailingNewline(
+              renderMarkdownToAnsi(activeStream, stdout?.columns ?? process.stdout?.columns) || activeStream
+            )}
           </Text>
         </Box>
       )}
@@ -794,7 +807,7 @@ const ChatInterface: React.FC<{
       ))}
 
       {isProcessing ? (
-        <Box>
+        <Box marginTop={1}>
           <Text color="cyan">Processing... (Ctrl+C to interrupt)</Text>
         </Box>
       ) : (
