@@ -473,8 +473,55 @@ const ChatInterface: React.FC<{
   const { stdout } = useStdout();
   const logIdRef = useRef(0);
   const [logEntries, setLogEntries] = useState<LogEntry[]>([]);
-  const [activeStream, setActiveStream] = useState<string | null>(null);
+  const [activeStream, setActiveStreamState] = useState<string | null>(null);
   const [transientToolDisplays, setTransientToolDisplays] = useState<Array<{ id: string; content: string }>>([]);
+
+  const activeStreamRef = useRef<string | null>(null);
+  const pendingActiveStreamRef = useRef<string | null>(null);
+  const activeStreamTimerRef = useRef<NodeJS.Timeout | null>(null);
+
+  useEffect(() => {
+    activeStreamRef.current = activeStream;
+  }, [activeStream]);
+
+  const commitActiveStream = useCallback((value: string | null) => {
+    if (activeStreamTimerRef.current) {
+      clearTimeout(activeStreamTimerRef.current);
+      activeStreamTimerRef.current = null;
+    }
+    pendingActiveStreamRef.current = value;
+    if (activeStreamRef.current !== value) {
+      setActiveStreamState(value);
+    }
+  }, []);
+
+  const scheduleActiveStream = useCallback((value: string | null) => {
+    pendingActiveStreamRef.current = value;
+
+    if (activeStreamRef.current === null) {
+      commitActiveStream(value);
+      return;
+    }
+
+    if (activeStreamTimerRef.current) {
+      return;
+    }
+
+    activeStreamTimerRef.current = setTimeout(() => {
+      activeStreamTimerRef.current = null;
+      const nextValue = pendingActiveStreamRef.current ?? null;
+      if (activeStreamRef.current !== nextValue) {
+        setActiveStreamState(nextValue);
+      }
+    }, 40);
+  }, [commitActiveStream]);
+
+  useEffect(() => () => {
+    if (activeStreamTimerRef.current) {
+      clearTimeout(activeStreamTimerRef.current);
+      activeStreamTimerRef.current = null;
+    }
+  }, []);
 
   const appendLog = useCallback((rawContent: string, kind: LogKind = 'log') => {
     const id = `log-${logIdRef.current++}`;
@@ -646,7 +693,7 @@ const ChatInterface: React.FC<{
         let headerPrinted = false;
         let hasStreamRendered = false;
 
-        setActiveStream(null);
+        commitActiveStream(null);
         setTransientToolDisplays([]);
 
         const builtinToolsKw: string[] = [];
@@ -717,7 +764,7 @@ const ChatInterface: React.FC<{
               headerPrinted = true;
             }
 
-            setActiveStream(prev => (prev === displayBuffer ? prev : displayBuffer));
+            scheduleActiveStream(displayBuffer);
             hasStreamRendered = true;
           }
         }
@@ -728,7 +775,7 @@ const ChatInterface: React.FC<{
             if (!headerPrinted) {
               headerPrinted = true;
             }
-            setActiveStream(fallbackDisplay);
+            commitActiveStream(fallbackDisplay);
             displayBuffer = fallbackDisplay;
             hasStreamRendered = true;
           }
@@ -823,7 +870,7 @@ const ChatInterface: React.FC<{
           }
         }
 
-        setActiveStream(null);
+        commitActiveStream(null);
         setTransientToolDisplays([]);
 
         const assistantMessage: Message = { role: 'assistant' };
@@ -886,7 +933,7 @@ const ChatInterface: React.FC<{
     } catch (error) {
       appendLog(`\nError: ${String(error)}\n`, 'error');
     } finally {
-      setActiveStream(null);
+      commitActiveStream(null);
       setTransientToolDisplays([]);
       if (isInterruptedRef.current) {
         appendLog(`\n✗ Response interrupted by user.\n`, 'system');
