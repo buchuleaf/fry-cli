@@ -110,7 +110,10 @@ async function fetchLatestVersion(pkgName: string, timeoutMs = 3000): Promise<st
     req.on('timeout', () => { try { req.destroy(); } catch {} resolve(null); });
   });
 }
-async function maybeSelfUpdate(opts?: { skip?: boolean, timeoutMs?: number }) {
+async function maybeSelfUpdate(
+  opts?: { skip?: boolean, timeoutMs?: number },
+  emit?: (message: string, kind?: 'system' | 'error') => void
+) {
   try {
     const envSkip = String(process.env.FRYCLI_NO_UPDATE || process.env.NO_UPDATE || '').toLowerCase();
     if (opts?.skip || envSkip === '1' || envSkip === 'true') return;
@@ -145,13 +148,13 @@ async function maybeSelfUpdate(opts?: { skip?: boolean, timeoutMs?: number }) {
       const hintCmd = process.platform === 'win32'
         ? `npm i -g ${pkgName}@latest`
         : `sudo npm i -g ${pkgName}@latest`;
-      console.log(`A new version of Fry CLI is available (${current} → ${latest}).`);
-      console.log('Auto-update skipped: no write access to global npm directory.');
-      console.log(`To update manually, run: ${hintCmd}`);
+      emit?.(`A new version of Fry CLI is available (${current} → ${latest}).\n`, 'system');
+      emit?.('Auto-update skipped: no write access to global npm directory.\n', 'system');
+      emit?.(`To update manually, run: ${hintCmd}\n`, 'system');
       return;
     }
 
-    console.log(`A new version of Fry CLI is available (${current} → ${latest}). Updating...`);
+    emit?.(`A new version of Fry CLI is available (${current} → ${latest}). Updating...\n`, 'system');
     const args = ['i', '-g', `${pkgName}@latest`];
     const result = spawnSync(npmCmd, args, {
       stdio: 'pipe',
@@ -159,16 +162,16 @@ async function maybeSelfUpdate(opts?: { skip?: boolean, timeoutMs?: number }) {
       timeout: opts?.timeoutMs ?? 15000
     });
     if (result.error) {
-      console.log('Auto-update skipped (npm not available).');
+      emit?.('Auto-update skipped (npm not available).\n', 'error');
     } else if (result.status !== 0) {
       const stderr = (result.stderr || '').toString().trim();
       const tail = stderr.split('\n').slice(-1)[0] || 'unknown error';
-      console.log(`Auto-update failed: ${tail}. Continuing with current version.`);
+      emit?.(`Auto-update failed: ${tail}. Continuing with current version.\n`, 'error');
     } else {
-      console.log('Fry CLI updated successfully. You may need to re-run to use the new version.');
+      emit?.('Fry CLI updated successfully. You may need to re-run to use the new version.\n', 'system');
     }
-  } catch {
-    // swallow
+  } catch (error) {
+    emit?.(`Auto-update encountered an unexpected error: ${String(error)}\n`, 'error');
   }
 }
 
@@ -201,8 +204,11 @@ type StreamChunk = {
   choices?: ChoiceDelta[];
 };
 
+type LogKind = 'system' | 'user' | 'assistant' | 'tool' | 'log' | 'error';
+
 type LogEntry = {
   id: string;
+  kind: LogKind;
   content: string;
 };
 
@@ -338,13 +344,12 @@ const ChatInterface: React.FC<{
   const { stdout } = useStdout();
   const logIdRef = useRef(0);
   const [logEntries, setLogEntries] = useState<LogEntry[]>([]);
-  const [activeStream, setActiveStream] = useState<{ content: string } | null>(null);
+  const [activeStream, setActiveStream] = useState<string | null>(null);
   const [transientToolDisplays, setTransientToolDisplays] = useState<Array<{ id: string; content: string }>>([]);
 
-  const appendLog = useCallback((content: string) => {
+  const appendLog = useCallback((content: string, kind: LogKind = 'log') => {
     const id = `log-${logIdRef.current++}`;
-    const normalized = content.endsWith('\n') ? content : `${content}\n`;
-    setLogEntries(prev => [...prev, { id, content: normalized }]);
+    setLogEntries(prev => [...prev, { id, kind, content }]);
   }, []);
 
   useEffect(() => {
@@ -356,19 +361,20 @@ const ChatInterface: React.FC<{
       debug: console.debug,
     };
 
-    const wrap = <T extends (...args: any[]) => void>(original: T): T => {
+    const wrap = <T extends (...args: any[]) => void>(original: T, kind: LogKind): T => {
       const wrapped = ((...args: Parameters<T>) => {
         const text = format(...args);
-        appendLog(text.endsWith('\n') ? text : `${text}\n`);
+        const normalized = text.endsWith('\n') ? text : `${text}\n`;
+        appendLog(normalized, kind);
       }) as T;
       return wrapped;
     };
 
-    console.log = wrap(originalConsole.log);
-    console.info = wrap(originalConsole.info);
-    console.warn = wrap(originalConsole.warn);
-    console.error = wrap(originalConsole.error);
-    console.debug = wrap(originalConsole.debug);
+    console.log = wrap(originalConsole.log, 'log');
+    console.info = wrap(originalConsole.info, 'log');
+    console.warn = wrap(originalConsole.warn, 'log');
+    console.error = wrap(originalConsole.error, 'error');
+    console.debug = wrap(originalConsole.debug, 'log');
 
     return () => {
       console.log = originalConsole.log;
@@ -399,7 +405,7 @@ const ChatInterface: React.FC<{
       lines.push('History cleared. New session started.');
       clearedNoticeRef.current = false;
     }
-    appendLog(lines.join('\n') + '\n');
+    appendLog(`${lines.join('\n')}\n`, 'system');
   }, [appendLog, sessionData]);
 
   const executeToolCall = async (toolCall: ToolCall): Promise<ToolResult> => {
@@ -416,7 +422,7 @@ const ChatInterface: React.FC<{
         .join(', ');
     } catch {}
 
-    appendLog(`🔧 Executing: ${toolName}(${argsStr})\n`);
+    appendLog(`🔧 Executing: ${toolName}(${argsStr})\n`, 'tool');
 
     let result: ToolResult;
     try {
@@ -473,7 +479,7 @@ const ChatInterface: React.FC<{
     }
 
     const indented = resultText.split('\n').map(l => `  ${l}`).join('\n');
-    appendLog(`[${toolName}] ${result.status}:\n${indented}\n`);
+    appendLog(`[${toolName}] ${result.status}:\n${indented}\n`, 'tool');
 
     return result;
   };
@@ -572,58 +578,37 @@ const ChatInterface: React.FC<{
           if (delta.content) {
             accumulatedOutput += delta.content;
 
-            const columns = stdout?.columns ?? process.stdout?.columns;
-            const rendered = renderMarkdownToAnsi(accumulatedOutput, columns);
-            const renderedForDisplay = rendered || accumulatedOutput;
-            const normalizedDisplay = renderedForDisplay.endsWith('\n')
-              ? renderedForDisplay
-              : `${renderedForDisplay}\n`;
-
-            if (!hasStreamRendered && normalizedDisplay.trim().length === 0) {
+            if (!hasStreamRendered && accumulatedOutput.trim().length === 0) {
               continue;
             }
 
             if (!headerPrinted) {
               headerPrinted = true;
-              setActiveStream(prev => prev ?? { content: '' });
             }
 
-            setActiveStream(prev => (prev?.content === normalizedDisplay ? prev : { content: normalizedDisplay }));
+            setActiveStream(prev => (prev === accumulatedOutput ? prev : accumulatedOutput));
             hasStreamRendered = true;
           }
         }
 
         if (!hasStreamRendered && accumulatedOutput.length > 0) {
-          const columns = stdout?.columns ?? process.stdout?.columns;
-          const rendered = renderMarkdownToAnsi(accumulatedOutput, columns);
-          const renderedForDisplay = rendered || accumulatedOutput;
-          if (renderedForDisplay.trim().length > 0) {
+          if (accumulatedOutput.trim().length > 0) {
             if (!headerPrinted) {
               headerPrinted = true;
-              setActiveStream(prev => prev ?? { content: '' });
             }
-            const normalizedFallback = renderedForDisplay.endsWith('\n')
-              ? renderedForDisplay
-              : `${renderedForDisplay}\n`;
-            setActiveStream(prev => (prev?.content === normalizedFallback ? prev : { content: normalizedFallback }));
+            setActiveStream(accumulatedOutput);
             hasStreamRendered = true;
           }
         }
 
         if (headerPrinted && accumulatedOutput.trim().length > 0) {
-          const columns = stdout?.columns ?? process.stdout?.columns;
-          const rendered = renderMarkdownToAnsi(accumulatedOutput, columns);
-          const renderedForDisplay = rendered || accumulatedOutput;
-          const normalizedFinal = renderedForDisplay.endsWith('\n')
-            ? renderedForDisplay
-            : `${renderedForDisplay}\n`;
-          appendLog(`\n🤖 Fry:\n${normalizedFinal}`);
+          appendLog(accumulatedOutput, 'assistant');
         }
 
         if (toolDisplayBuffer.size > 0) {
           for (const [index, data] of toolDisplayBuffer.entries()) {
             const content = formatToolDisplay(index, data);
-            appendLog(`\n${content}\n`);
+            appendLog(`\n${content}\n`, 'tool');
           }
         }
 
@@ -689,12 +674,12 @@ const ChatInterface: React.FC<{
         }
       }
     } catch (error) {
-      appendLog(`\nError: ${String(error)}\n`);
+      appendLog(`\nError: ${String(error)}\n`, 'error');
     } finally {
       setActiveStream(null);
       setTransientToolDisplays([]);
       if (isInterruptedRef.current) {
-        appendLog(`\n✗ Response interrupted by user.\n`);
+        appendLog(`\n✗ Response interrupted by user.\n`, 'system');
         isInterruptedRef.current = false;
       }
       setIsProcessing(false);
@@ -727,7 +712,7 @@ const ChatInterface: React.FC<{
       return;
     }
 
-    appendLog(`\n👤 You:\n${userInput}\n`);
+    appendLog(userInput, 'user');
 
     await processChatTurn(userInput);
   };
@@ -749,17 +734,56 @@ const ChatInterface: React.FC<{
   return (
     <Box flexDirection="column">
       <Static items={logEntries}>
-        {(entry) => (
-          <Box key={entry.id} flexDirection="column">
-            <Text>{entry.content}</Text>
-          </Box>
-        )}
+        {(entry) => {
+          if (entry.kind === 'assistant') {
+            const markdown = renderMarkdownToAnsi(entry.content, stdout?.columns ?? process.stdout?.columns) || entry.content;
+            return (
+              <Box key={entry.id} flexDirection="column" marginTop={1}>
+                <Text color="green">🤖 Fry:</Text>
+                <Text>{markdown}</Text>
+              </Box>
+            );
+          }
+
+          if (entry.kind === 'user') {
+            return (
+              <Box key={entry.id} flexDirection="column" marginTop={1}>
+                <Text color="blue">👤 You:</Text>
+                <Text>{entry.content}</Text>
+              </Box>
+            );
+          }
+
+          if (entry.kind === 'tool') {
+            return (
+              <Box key={entry.id} flexDirection="column" marginTop={1}>
+                <Text color="yellow">{entry.content}</Text>
+              </Box>
+            );
+          }
+
+          if (entry.kind === 'error') {
+            return (
+              <Box key={entry.id} flexDirection="column" marginTop={1}>
+                <Text color="red">{entry.content}</Text>
+              </Box>
+            );
+          }
+
+          return (
+            <Box key={entry.id} flexDirection="column" marginTop={1}>
+              <Text>{entry.content}</Text>
+            </Box>
+          );
+        }}
       </Static>
 
-      {activeStream && (
+      {activeStream && activeStream.trim().length > 0 && (
         <Box flexDirection="column" marginTop={1}>
           <Text color="green">🤖 Fry:</Text>
-          {activeStream.content && <Text>{activeStream.content}</Text>}
+          <Text>
+            {renderMarkdownToAnsi(activeStream, stdout?.columns ?? process.stdout?.columns) || activeStream}
+          </Text>
         </Box>
       )}
 
